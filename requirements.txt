@@ -5,3 +5,7 @@ opencv-python
 numpy<2
 pandas
 av
+tensorflow==2.15.1
+ml_dtypes==0.3.2
+jax==0.4.30
+jaxlib==0.4.30
