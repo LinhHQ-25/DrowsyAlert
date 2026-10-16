@@ -18,6 +18,18 @@ import sys
 import time
 from pathlib import Path
 
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -368,6 +380,11 @@ def main():
     stamp = time.strftime("%Y%m%d_%H%M%S")
     root_dir = Path(args.out) / stamp
     root_dir.mkdir(parents=True, exist_ok=True)
+    if hasattr(sys.__stdout__, "reconfigure"):
+        try:
+            sys.__stdout__.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     sys.stdout = Tee(sys.__stdout__, open(root_dir / "console.txt", "w", encoding="utf-8"))
     print(f"Thư mục kết quả của lần chạy này: {root_dir}")
     summary = {n: {CLASSES[k]: int((d.label == k).sum()) for k in (0, 1)}

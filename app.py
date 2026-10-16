@@ -19,6 +19,19 @@ Chạy: python -m streamlit run app.py
 import os
 import sys
 
+# Đảm bảo bảng mã UTF-8 trên Windows console
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # Tự động đồng bộ và chuyển sang Streamlit khi chạy bằng `python app.py` hoặc bấm nút Run ▶ trong VS Code
 if __name__ == "__main__":
     try:
@@ -26,22 +39,35 @@ if __name__ == "__main__":
         if not _st_exists():
             import subprocess
             os.environ["PYTHONUTF8"] = "1"
-            cmd = [sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__)]
+            _dir = os.path.dirname(os.path.abspath(__file__))
+            _py_bin = sys.executable
+            _venv_py = os.path.join(_dir, "venv", "Scripts", "python.exe")
+            if os.path.exists(_venv_py) and os.path.abspath(_py_bin) != os.path.abspath(_venv_py):
+                _py_bin = _venv_py
+            cmd = [_py_bin, "-m", "streamlit", "run", os.path.abspath(__file__)]
             sys.exit(subprocess.call(cmd))
     except Exception:
         pass
 
-# Tự động khắc phục lỗi đường dẫn tiếng Việt của MediaPipe C++ trên Windows
+# Tự động khắc phục lỗi đường dẫn tiếng Việt / non-ASCII của MediaPipe C++ trên Windows
 try:
     if os.name == "nt":
+        import ctypes
         import mediapipe.python.solution_base as _mp_sb
-        _sys_mp_root = r"C:\Users\tranl\AppData\Local\Programs\Python\Python310\Lib\site-packages\mediapipe"
-        if os.path.exists(_sys_mp_root):
+
+        def _get_short_path(path):
+            buf = ctypes.create_unicode_buffer(1024)
+            if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024):
+                return buf.value
+            return str(path)
+
+        _short_file = _get_short_path(_mp_sb.__file__)
+        if _short_file and os.path.exists(_short_file):
             _orig_sb_init = _mp_sb.SolutionBase.__init__
 
             def _patched_sb_init(self, *args, **kwargs):
                 orig_file = _mp_sb.__file__
-                _mp_sb.__file__ = os.path.join(_sys_mp_root, "python", "solution_base.py")
+                _mp_sb.__file__ = _short_file
                 try:
                     return _orig_sb_init(self, *args, **kwargs)
                 finally:
@@ -1499,7 +1525,7 @@ sound_ph = st.empty()
 if test_sound:
     wav_b64 = base64.b64encode(beep_wav()).decode("ascii")
     sound_ph.markdown(
-        f'<audio autoplay style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
+        f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
         unsafe_allow_html=True,
     )
 
@@ -1726,14 +1752,14 @@ while ctx.state.playing:
     if alert_on and sound_on and (not last_alarm_on or now - last_beep >= 2.0):
         wav_b64 = base64.b64encode(beep_wav()).decode("ascii")
         sound_ph.markdown(
-            f'<audio autoplay style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
+            f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
             unsafe_allow_html=True,
         )
         last_beep = now
     elif distract_on and sound_on and (not last_distract_on or now - last_beep >= 2.2):
         wav_b64 = base64.b64encode(distract_wav()).decode("ascii")
         sound_ph.markdown(
-            f'<audio autoplay style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
+            f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
             unsafe_allow_html=True,
         )
         last_beep = now

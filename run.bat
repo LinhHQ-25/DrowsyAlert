@@ -9,11 +9,11 @@ echo           DrowsyAlert - He thong giam sat lai xe
 echo ======================================================
 echo Dang khoi dong ung dung tren trinh duyet...
 
-if exist venv\Scripts\activate.bat (
+if exist venv\Scripts\python.exe (
     call venv\Scripts\activate.bat
-    python -m streamlit run app.py
+    venv\Scripts\python.exe -m streamlit run app.py
 ) else (
-    streamlit run app.py
+    python -m streamlit run app.py
 )
 
 pause
