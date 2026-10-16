@@ -372,7 +372,7 @@ class DrowsyProcessor(VideoProcessorBase):
             self.yawn_recovered_since = None
             self.last_yawn_event_at = -1e9
             self.open_ear_samples = collections.deque(maxlen=90)
-            self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.78
+            self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.76
             self.eye_open_since = None
             self.eye_open_candidate_since = None
             self.eye_closed_count = 0
@@ -631,8 +631,7 @@ class DrowsyProcessor(VideoProcessorBase):
 
         # Xác định mốc tham chiếu EAR (cá nhân hoặc fallback)
         fallback_thr = float(self.cfg.get("ear_thr", 0.21))
-        # Người đeo kính có mốc mở mắt tự nhiên thấp hơn (thường ~0.18-0.22) do gọng kính che bớt
-        default_ref = 0.22 if glasses_active else (fallback_thr / 0.78)
+        default_ref = fallback_thr / 0.76
         base_ref = self.open_ear_ref if self.open_ear_ref is not None else default_ref
 
         min_p = float(np.min(closed_prob)) if len(closed_prob) else smooth_prob
@@ -643,21 +642,33 @@ class DrowsyProcessor(VideoProcessorBase):
         ear_ratio = ear / max(base_ref, 0.01)
 
         if glasses_active:
-            # === CHẾ ĐỘ ĐEO KÍNH MẮT ===
-            # Gọng kính tạo viền tối khiến CNN có xu hướng dự đoán nhắm cao (false positive).
-            # Do đó, chỉ dựa vào sự sụt giảm thực sự của độ mở mắt (Delta EAR):
-            # 1. Khi mắt mở bình thường: dù CNN báo nhắm do gọng kính, nhưng EAR không giảm -> MẮT MỞ!
-            if ear_ratio >= 0.76 or ear >= (0.82 * fallback_thr):
+            # === CHẾ ĐỘ KÍNH MẮT ===
+            # Kết hợp đa tín hiệu bù trừ cho gọng kính và tròng kính:
+            # 1. Rõ ràng MỞ (Tỉnh táo): EAR đạt >= 80% baseline và CNN không báo nhắm quá cao
+            if (ear_ratio >= 0.80 and mean_p <= 0.68) or (mean_p <= 0.28 and ear_ratio >= 0.72):
                 self.eye_state_closed = False
                 self.eye_confident = True
-            # 2. Khi nhắm mắt thật (ngủ gật): mí mắt khép lại, EAR sụt giảm rõ rệt (> 32%)
-            elif ear_ratio <= 0.62 or ear <= 0.12:
+            # 2. Rõ ràng NHẮM (Buồn ngủ / Ngủ gật): EAR sụt giảm rõ rệt (> 36%) hoặc CNN báo nhắm rất cao
+            elif ear_ratio <= 0.64 or ear <= 0.13:
                 self.eye_state_closed = True
                 self.eye_confident = True
-            # 3. Vùng trung gian (mắt lim dim / nửa nhắm nửa mở):
-            # Cần cả CNN đồng thuận (mean_p >= 0.55) VÀ EAR có giảm (ear_ratio <= 0.72)
+            elif mean_p >= 0.78 and ear_ratio <= 0.78:
+                self.eye_state_closed = True
+                self.eye_confident = True
+            elif mean_p >= 0.85:
+                self.eye_state_closed = True
+                self.eye_confident = True
+            # 3. Vùng trung gian: cả EAR giảm và CNN cùng nghiêng về nhắm
+            elif ear_ratio <= 0.72 and mean_p >= 0.45:
+                self.eye_state_closed = True
+                self.eye_confident = True
+            # 4. Hysteresis giữ trạng thái chống rung nhấp nháy
+            elif self.eye_state_closed:
+                # Đang nhắm: chỉ mở lại khi mắt mở rõ ràng
+                self.eye_state_closed = not (ear_ratio >= 0.78 and mean_p <= 0.52)
+                self.eye_confident = True
             else:
-                self.eye_state_closed = bool(mean_p >= 0.55 and ear_ratio <= 0.72)
+                self.eye_state_closed = bool(mean_p >= 0.60 and ear_ratio <= 0.75)
                 self.eye_confident = True
         else:
             # === CHẾ ĐỘ TIÊU CHUẨN (KHÔNG ĐEO KÍNH) ===
@@ -666,7 +677,7 @@ class DrowsyProcessor(VideoProcessorBase):
 
             ear_closed_signal = (ear <= ear_close_thr) and (mean_p >= 0.35)
             cnn_closed_signal = (mean_p >= 0.58 and ear <= ear_open_thr) or (max_p >= 0.75 and ear <= ear_open_thr)
-            deep_closed_signal = ear <= (0.68 * base_ref)
+            deep_closed_signal = ear <= (0.68 * base_ref) or ear <= 0.13
 
             clearly_open = (ear >= ear_open_thr) and (mean_p <= 0.55)
 
@@ -676,8 +687,11 @@ class DrowsyProcessor(VideoProcessorBase):
             elif deep_closed_signal or ear_closed_signal or cnn_closed_signal:
                 self.eye_state_closed = True
                 self.eye_confident = True
-            elif mean_p <= 0.30 and ear > ear_close_thr:
+            elif mean_p <= 0.28 and ear > ear_close_thr:
                 self.eye_state_closed = False
+                self.eye_confident = True
+            elif self.eye_state_closed:
+                self.eye_state_closed = not (ear >= 0.82 * base_ref and mean_p <= 0.48)
                 self.eye_confident = True
             else:
                 # Vùng chuyển tiếp / nửa nhắm nửa mở
@@ -785,7 +799,7 @@ class DrowsyProcessor(VideoProcessorBase):
                 self.yaw_buf.clear()
                 if missing_dur >= 2.5:
                     self.open_ear_samples.clear()
-                    self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.78
+                    self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.76
 
             self.processing_ms = (time.perf_counter() - t_frame) * 1000.0
             self._push(dict(face=False, risk_level="Không thấy khuôn mặt"),
@@ -851,9 +865,9 @@ class DrowsyProcessor(VideoProcessorBase):
             glasses_active = bool(self.glasses_detected)
         self.glasses_active = glasses_active
 
-        # Crop đúng một lần/frame; dùng chung cho kiểm tra chất lượng và CNN (nếu đeo kính bật enhance CLAHE)
-        right_crop_q = crop_eye(gray, pts[RIGHT_EYE], enhance=glasses_active)
-        left_crop_q = crop_eye(gray, pts[LEFT_EYE], enhance=glasses_active)
+        # Crop đúng một lần/frame; dùng chung cho kiểm tra chất lượng và CNN
+        right_crop_q = crop_eye(gray, pts[RIGHT_EYE], enhance=False)
+        left_crop_q = crop_eye(gray, pts[LEFT_EYE], enhance=False)
         contrasts = [float(np.std(c * 255.0)) for c in (right_crop_q, left_crop_q) if c is not None]
         eye_contrast = float(np.mean(contrasts)) if contrasts else 0.0
 
@@ -878,23 +892,21 @@ class DrowsyProcessor(VideoProcessorBase):
         quality_parts = [float(yaw_ok), float(light_ok), float(contrast_ok)]
         observation_quality = float(np.mean(quality_parts))
 
-        # Tự động cập nhật baseline EAR mở mắt khi mắt mở rõ (CNN dự đoán nhắm thấp hoặc ở chế độ kính)
+        # Tự động cập nhật baseline EAR mở mắt khi mắt mở rõ (không lấy mẫu khi đang nhắm mắt)
         # Hỗ trợ tự nhiên cho mọi người dùng (mắt to, mắt nhỏ, mắt một mí, đeo kính cận)
         mean_p_raw = float(np.mean(self.eye_prob_hist)) if self.eye_prob_hist else 0.5
-        allow_ear_sample = (
-            (glasses_active and (now - self.session_started_at <= 6.0 or not self.eye_state_closed))
-            or (mean_p_raw <= 0.35 or not self.eye_state_closed)
-            or (now - self.session_started_at <= 4.0)
+        allow_ear_sample = bool(
+            not self.eye_state_closed and mean_p_raw <= 0.48 and ear >= 0.18
         )
-        if (eye_valid and 0.11 <= ear <= 0.45 and allow_ear_sample):
+        if (eye_valid and 0.18 <= ear <= 0.45 and allow_ear_sample):
             self.open_ear_samples.append(ear)
             if len(self.open_ear_samples) >= 8:
-                est = float(np.percentile(self.open_ear_samples, 75))
+                est = float(np.percentile(self.open_ear_samples, 85))
                 # Cập nhật mượt mà (smooth exponential) để thích ứng cả khi người dùng đổi tư thế
                 if self.open_ear_ref is None:
                     self.open_ear_ref = est
                 else:
-                    self.open_ear_ref = 0.85 * self.open_ear_ref + 0.15 * est
+                    self.open_ear_ref = 0.88 * self.open_ear_ref + 0.12 * est
 
         closed = bool(self._eye_closed(right_crop_q, left_crop_q, ear, eye_valid=eye_valid, glasses_active=glasses_active))
 
