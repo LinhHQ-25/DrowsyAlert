@@ -225,36 +225,52 @@ def crop_eye(gray, eye_pts, size=EYE_INPUT, enhance=False):
 
 
 def check_glasses_features(gray, pts):
-    """Phát hiện gọng kính mắt dựa vào cầu nối sống mũi (nose bridge)."""
+    """Phát hiện gọng kính mắt dựa vào cầu nối sống mũi (nose bridge).
+    - Không kính: Sống mũi là gờ dọc, cạnh dọc (Sobel X) chiếm ưu thế, cạnh ngang (Sobel Y) rất yếu,
+      độ sáng tăng/giảm đơn điệu dọc theo sống mũi.
+    - Có kính: Thanh cầu kính vắt ngang tạo cạnh ngang (Sobel Y) nổi bật và/hoặc vết trũng tối
+      (dark valley) ở giữa sống mũi kẹp giữa 2 vùng da sáng hơn.
+    """
     if pts is None or len(pts) < 400:
         return False, 0.0
     p_r = pts[133]  # khóe trong mắt phải
     p_l = pts[362]  # khóe trong mắt trái
-    p_mid = pts[168]  # giữa hai mắt trên sống mũi
+    p_mid = pts[6]   # điểm chính giữa 2 mắt trên sống mũi
     dx = float(p_l[0] - p_r[0])
     if dx < 12.0:
         return False, 0.0
 
-    w_box = int(dx * 0.70)
-    h_box = int(max(6, dx * 0.35))
+    w_box = int(dx * 0.48)
+    h_box = int(max(8, dx * 0.40))
     cx, cy = int(p_mid[0]), int(p_mid[1])
     H, W = gray.shape[:2]
     x0, x1 = max(0, cx - w_box // 2), min(W, cx + w_box // 2)
     y0, y1 = max(0, cy - h_box // 2), min(H, cy + h_box // 2)
-    if (x1 - x0) < 6 or (y1 - y0) < 4:
+    if (x1 - x0) < 6 or (y1 - y0) < 6:
         return False, 0.0
 
     bridge_patch = gray[y0:y1, x0:x1]
-    sobel_x = cv2.Sobel(bridge_patch, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(bridge_patch, cv2.CV_32F, 0, 1, ksize=3)
-    mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
-    mean_edge = float(np.mean(mag))
-    std_patch = float(np.std(bridge_patch))
+    sobel_x = cv2.Sobel(bridge_patch, cv2.CV_32F, 1, 0, ksize=3)
+    mean_sy = float(np.mean(np.abs(sobel_y)))
+    mean_sx = float(np.mean(np.abs(sobel_x)))
 
-    # Mặt người bình thường không kính sống mũi rất mịn (mean_edge ~ 8-16, std_patch < 12)
-    # Người đeo kính có cầu gọng vắt ngang tạo viền cạnh sắc nét (mean_edge >= 22 hoặc std_patch >= 14)
-    has_bridge = bool(mean_edge >= 22.0 or (mean_edge >= 18.0 and std_patch >= 14.0))
-    return has_bridge, mean_edge
+    # Kiểm tra vết trũng tối (dark valley) theo chiều dọc (đặc trưng thanh ngang gọng kính)
+    row_means = np.mean(bridge_patch, axis=1)
+    min_idx = int(np.argmin(row_means))
+    has_valley = False
+    valley_depth = 0.0
+    if 1 < min_idx < len(row_means) - 2:
+        top_diff = row_means[0] - row_means[min_idx]
+        bot_diff = row_means[-1] - row_means[min_idx]
+        valley_depth = float(min(top_diff, bot_diff))
+        if valley_depth >= 8.0:
+            has_valley = True
+
+    sy_sx_ratio = mean_sy / (mean_sx + 1e-6)
+    # Cạnh ngang của gọng kính phải rõ nét và không bị lấn át bởi gờ sống mũi dọc
+    has_bridge = bool((has_valley and mean_sy >= 26.0) or (mean_sy >= 48.0 and sy_sx_ratio >= 0.50))
+    return has_bridge, mean_sy
 
 
 _GLOBAL_CNN = None
@@ -381,7 +397,7 @@ class DrowsyProcessor(VideoProcessorBase):
             self.mask_detected = False
             self.glasses_detected = False
             self.glasses_active = False
-            self.glasses_hist = collections.deque(maxlen=20)
+            self.glasses_hist = collections.deque(maxlen=25)
             self.reason = ""
             self.score = 0.0
             self.risk_level = "Tỉnh táo"
@@ -404,7 +420,7 @@ class DrowsyProcessor(VideoProcessorBase):
         return dict(
             face=False, drowsy=False, reason="", risk_level="Chưa đủ dữ liệu", score=0.0,
             distracted=False, distracted_for=0.0, distractions=0, mask_detected=False,
-            glasses_detected=False, glasses_active=False,
+            glasses_detected=False, glasses_active=False, glasses_cfg=self.cfg.get("glasses_mode", "auto"),
             perclos=0.0, perclos_ready=False, ear=0.0, mar=0.0,
             pitch_dev=0.0, yaw_dev=0.0, yawns=0, nods=0,
             closed=False, eye_valid=False, eye_confident=False, mouth_valid=False,
@@ -822,9 +838,9 @@ class DrowsyProcessor(VideoProcessorBase):
         has_glasses_bridge, bridge_edge_score = check_glasses_features(gray, pts)
         self.glasses_hist.append(int(has_glasses_bridge))
         glasses_ratio = sum(self.glasses_hist) / len(self.glasses_hist) if self.glasses_hist else 0.0
-        if glasses_ratio >= 0.45:
+        if glasses_ratio >= 0.65:
             self.glasses_detected = True
-        elif glasses_ratio <= 0.20:
+        elif glasses_ratio <= 0.25:
             self.glasses_detected = False
 
         if glasses_cfg == "on":
@@ -1145,6 +1161,7 @@ class DrowsyProcessor(VideoProcessorBase):
             distracted=distracted, distracted_for=distracted_for,
             distractions=len(self.distraction_times), mask_detected=self.mask_detected,
             glasses_detected=self.glasses_detected, glasses_active=self.glasses_active,
+            glasses_cfg=glasses_cfg,
             risk_level=risk_level, score=total_score,
             perclos=perclos, perclos_ready=perclos_ready,
             ear=ear, mar=mar, pitch_dev=pitch_dev, yaw_dev=yaw_dev,
@@ -1620,11 +1637,15 @@ def render_dashboard(s, playing):
         else '<span style="color:var(--ok)">Bình thường</span>'
     )
 
-    glasses_text = (
-        '<span style="color:#4BB8F2">👓 Bật (Đang đeo kính)</span>' if s.get("glasses_active") else
-        ('<span style="color:#4BB8F2">👓 Tự phát hiện</span>' if s.get("glasses_detected") else
-         '<span style="color:var(--mute)">Không phát hiện</span>')
-    )
+    glasses_mode_cfg = s.get("glasses_cfg", "auto")
+    if glasses_mode_cfg == "on":
+        glasses_text = '<span style="color:#4BB8F2">👓 Bật thủ công (Đang đeo kính)</span>'
+    elif glasses_mode_cfg == "off":
+        glasses_text = '<span style="color:var(--mute)">Tắt thủ công (Không kính)</span>'
+    elif s.get("glasses_active"):
+        glasses_text = '<span style="color:#4BB8F2">👓 Tự phát hiện: Có kính</span>'
+    else:
+        glasses_text = '<span style="color:var(--mute)">Không phát hiện kính</span>'
 
     right_html = (
         '<div class="panel-stack right-panel">'
@@ -1678,7 +1699,7 @@ def render_chart(hist):
 render_dashboard(dict(
     face=False, drowsy=False, reason="", risk_level="Chưa bật camera", score=0.0,
     distracted=False, distracted_for=0.0, distractions=0, mask_detected=False,
-    glasses_detected=False, glasses_active=False,
+    glasses_detected=False, glasses_active=False, glasses_cfg=glasses_mode,
     perclos=0.0, perclos_ready=False, ear=0.0, mar=0.0, pitch_dev=0.0, yaw_dev=0.0,
     yawns=0, nods=0, blinks=0, slow_closures=0,
     closed=False, eye_valid=False, eye_confident=False, mouth_valid=False, brightness=0.0,
