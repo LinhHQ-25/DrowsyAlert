@@ -4,7 +4,7 @@ Phiên bản này ưu tiên giảm false-positive trong tình huống lái xe th
 - CNN mắt được làm mượt theo thời gian + hysteresis.
 - Loại frame mắt kém tin cậy khỏi PERCLOS (quay đầu lớn, quá tối/sáng, crop quá ít tương phản).
 - Ngáp/gật đầu là tín hiệu phụ; một lần đơn lẻ không đủ kết luận buồn ngủ.
-- C1..C4 dùng cùng các đặc trưng nhưng quyết định theo điểm số theo thời gian.
+- C1 = CNN + PERCLOS; C2 = C1 + MAR; C3 = C1 + Head Pose; C4 = C1 + Head Pose + MAR.
 - Có reset phiên đo để làm thực nghiệm sạch.
 - Luồng video độc lập; đồng bộ snapshot AI bằng ID frame và thời điểm nhận frame.
 - UI chỉ vẽ snapshot mới; dữ liệu cũ được đánh dấu thay vì giả như vẫn realtime.
@@ -16,70 +16,19 @@ Phiên bản này ưu tiên giảm false-positive trong tình huống lái xe th
 Chạy: python -m streamlit run app.py
 """
 
-import os
-import sys
-
-# Đảm bảo bảng mã UTF-8 trên Windows console
-if sys.platform == "win32":
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-    if hasattr(sys.stderr, "reconfigure"):
-        try:
-            sys.stderr.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-
-# Tự động đồng bộ và chuyển sang Streamlit khi chạy bằng `python app.py` hoặc bấm nút Run ▶ trong VS Code
-if __name__ == "__main__":
-    try:
-        from streamlit.runtime import exists as _st_exists
-        if not _st_exists():
-            import subprocess
-            os.environ["PYTHONUTF8"] = "1"
-            _dir = os.path.dirname(os.path.abspath(__file__))
-            _py_bin = sys.executable
-            _venv_py = os.path.join(_dir, "venv", "Scripts", "python.exe")
-            if os.path.exists(_venv_py) and os.path.abspath(_py_bin) != os.path.abspath(_venv_py):
-                _py_bin = _venv_py
-            cmd = [_py_bin, "-m", "streamlit", "run", os.path.abspath(__file__)]
-            sys.exit(subprocess.call(cmd))
-    except Exception:
-        pass
-
-# Tự động khắc phục lỗi đường dẫn tiếng Việt / non-ASCII của MediaPipe C++ trên Windows
-try:
-    if os.name == "nt":
-        import ctypes
-        import mediapipe.python.solution_base as _mp_sb
-
-        def _get_short_path(path):
-            buf = ctypes.create_unicode_buffer(1024)
-            if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024):
-                return buf.value
-            return str(path)
-
-        _short_file = _get_short_path(_mp_sb.__file__)
-        if _short_file and os.path.exists(_short_file):
-            _orig_sb_init = _mp_sb.SolutionBase.__init__
-
-            def _patched_sb_init(self, *args, **kwargs):
-                orig_file = _mp_sb.__file__
-                _mp_sb.__file__ = _short_file
-                try:
-                    return _orig_sb_init(self, *args, **kwargs)
-                finally:
-                    _mp_sb.__file__ = orig_file
-
-            _mp_sb.SolutionBase.__init__ = _patched_sb_init
-except Exception:
-    pass
-
 import base64
+from pathlib import Path
+import sys
+APP_PATH = Path(__file__).resolve()
+REPOSITORY_ROOT = APP_PATH.parent.parent if APP_PATH.parent.name == "changes" else APP_PATH.parent
+sys.path.insert(0, str(REPOSITORY_ROOT))
+from scripts.eye_test_diagnostics import DIAGNOSTIC_FIELDS, EyeDiagnosticsMixin, render_eye_diagnostics
+from scripts.eye_decision import cnn_eye_decision
+from scripts.perclos_experiment import ExperimentMixin, EXPERIMENT_FIELDS, render_experiment
+from scripts.alert_presentation import presentation_state, draw_camera_alert
 import collections
 import math
+import os
 import threading
 import time
 
@@ -104,8 +53,9 @@ MODEL_3D = np.array([
     (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0),
 ], dtype=np.float64)
 
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-EYE_MODEL_PATH = os.path.join(PROJECT_DIR, "models", "eye_cnn.keras")
+TEAM_MODEL_PATH = REPOSITORY_ROOT / "models/eye_cnn_team.keras"
+EYE_MODEL_PATH = str(TEAM_MODEL_PATH if TEAM_MODEL_PATH.is_file() else
+                     REPOSITORY_ROOT / "outputs/model_conversion/train_20261016_045537_835503/eye_cnn.keras")
 EYE_INPUT = 64
 CLOSED_IDX = 0
 
@@ -116,17 +66,16 @@ UI_INTERVAL = 0.10       # polling 10Hz nhẹ; chỉ render khi AI có frame m�
 DASHBOARD_INTERVAL = 0.125  # mục tiêu 8Hz, giảm tải Streamlit/browser
 DEBUG_INTERVAL = 1.00   # debug ở tab thu gọn, không tranh FPS với camera
 CHART_INTERVAL = 2.00   # tránh redraw chart thường xuyên
-STALE_AFTER_S = 1.80    # dung sai mạng/CPU (1.8s) để không ngắt còi và reset dữ liệu oan
-OVERLAY_MAX_AGE_S = 1.50  # giữ hộp giữa các lần AI cập nhật
-OVERLAY_MISSING_GRACE_S = 0.60  # FaceMesh rớt 1-2 khung: vẫn giữ hộp tránh nhấp nháy
-OVERLAY_DIM_AFTER_S = 1.00  # AI chậm: hộp chuyển xám
-ALARM_EVIDENCE_HOLD_S = 0.80  # tín hiệu kết hợp phải bền, không phát còi tức thì
-ALARM_COOLDOWN_S = 5.0  # sau khi hết cảnh báo, tránh báo lại liên tục bởi dữ kiện cũ
-PERCLOS_EVIDENCE_HOLD_S = 2.2  # PERCLOS cao kéo dài 2.2s là đủ tin cậy
+STALE_AFTER_S = 0.85    # nếu AI mất cập nhật, ngừng hiển thị như số liệu hiện tại
+OVERLAY_MAX_AGE_S = 1.20  # giữ hộp giữa các lần AI cập nhật; quá tuổi => ẩn để tránh hộp trôi
+OVERLAY_MISSING_GRACE_S = 0.50  # FaceMesh rớt 1-2 khung: vẫn giữ hộp tránh nhấp nháy
+OVERLAY_DIM_AFTER_S = 0.60  # AI chậm: hộp chuyển xám, không dùng để phát còi
+ALARM_EVIDENCE_HOLD_S = 1.35  # tín hiệu kết hợp phải bền, không phát còi tức thì
+ALARM_COOLDOWN_S = 7.0  # sau khi hết cảnh báo, tránh báo lại liên tục bởi dữ kiện cũ
+PERCLOS_EVIDENCE_HOLD_S = 3.0  # PERCLOS cao phải kéo dài
 EYE_RECENT_WINDOW_S = 8.0   # không quyết định chỉ từ PERCLOS quá khứ
 EVENT_WINDOW_S = 40.0  # đếm ngáp/gật lặp lại trong 40 giây
 MAX_SESSION_LOG_ROWS = 30000  # ~30-50 phút tuỳ AI FPS, giới hạn RAM
-POSE_INIT_SAMPLES = 15  # chỉ cần 15 mẫu (~2s) để xác lập mốc góc đầu ban đầu
 
 DEFAULT_CFG = dict(
     config="C4",
@@ -136,23 +85,22 @@ DEFAULT_CFG = dict(
     yaw_limit=35.0,
     window=30,
     perclos_thr=0.30,
-    closed_sec=1.5,
+    closed_sec=2.0,
     yawn_sec=1.5,
+    covered_yawn_sec=1.2,
     nod_sec=1.0,
     min_brightness=35.0,
     max_brightness=220.0,
-    min_eye_contrast=3.0,
-    distraction_enabled=True,
-    distract_yaw_deg=35.0,
-    distract_sec=3.0,
-    glasses_mode="auto",
+    min_eye_contrast=10.0,
+    detect_covered_yawn=True,
+    yawn_audio=True,
 )
 
 CONFIG_LABELS = {
-    "C1": "C1 · PERCLOS / mắt",
-    "C2": "C2 · PERCLOS + ngáp",
-    "C3": "C3 · PERCLOS + tư thế đầu",
-    "C4": "C4 · PERCLOS + ngáp + tư thế đầu",
+    "C1": "C1 · CNN + PERCLOS",
+    "C2": "C2 · C1 + MAR",
+    "C3": "C3 · C1 + Head Pose",
+    "C4": "C4 · C1 + Head Pose + MAR",
 }
 
 # OpenCV dùng BGR
@@ -202,13 +150,8 @@ def head_pose_angles(pts, w, h):
     return norm_angle(pitch), norm_angle(yaw), norm_angle(roll)
 
 
-_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-
-
-def crop_eye(gray, eye_pts, size=EYE_INPUT, enhance=False):
-    """Crop vuông quanh mắt; output xám 64x64 [0,1], khớp train_eye_cnn.py.
-    enhance=True: áp dụng CLAHE để làm dịu phản quang tròng kính và bóng gọng kính.
-    """
+def crop_eye(gray, eye_pts, size=EYE_INPUT):
+    """Crop vuông quanh mắt; output xám 64x64 [0,1], khớp train_eye_cnn.py."""
     x0, y0 = eye_pts.min(axis=0)
     x1, y1 = eye_pts.max(axis=0)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -218,64 +161,7 @@ def crop_eye(gray, eye_pts, size=EYE_INPUT, enhance=False):
     x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, W), min(y1, H)
     if x1 - x0 < 4 or y1 - y0 < 4:
         return None
-    patch = gray[y0:y1, x0:x1]
-    if enhance:
-        patch = _CLAHE.apply(patch)
-    return cv2.resize(patch, (size, size)).astype(np.float32) / 255.0
-
-
-def check_glasses_features(gray, pts):
-    """Phát hiện gọng kính mắt dựa vào cầu nối sống mũi (nose bridge).
-    - Không kính: Sống mũi là gờ dọc, cạnh dọc (Sobel X) chiếm ưu thế, cạnh ngang (Sobel Y) rất yếu,
-      độ sáng tăng/giảm đơn điệu dọc theo sống mũi.
-    - Có kính: Thanh cầu kính vắt ngang tạo cạnh ngang (Sobel Y) nổi bật và/hoặc vết trũng tối
-      (dark valley) ở giữa sống mũi kẹp giữa 2 vùng da sáng hơn.
-    """
-    if pts is None or len(pts) < 400:
-        return False, 0.0
-    p_r = pts[133]  # khóe trong mắt phải
-    p_l = pts[362]  # khóe trong mắt trái
-    p_mid = pts[6]   # điểm chính giữa 2 mắt trên sống mũi
-    dx = float(p_l[0] - p_r[0])
-    if dx < 12.0:
-        return False, 0.0
-
-    w_box = int(dx * 0.48)
-    h_box = int(max(8, dx * 0.40))
-    cx, cy = int(p_mid[0]), int(p_mid[1])
-    H, W = gray.shape[:2]
-    x0, x1 = max(0, cx - w_box // 2), min(W, cx + w_box // 2)
-    y0, y1 = max(0, cy - h_box // 2), min(H, cy + h_box // 2)
-    if (x1 - x0) < 6 or (y1 - y0) < 6:
-        return False, 0.0
-
-    bridge_patch = gray[y0:y1, x0:x1]
-    sobel_y = cv2.Sobel(bridge_patch, cv2.CV_32F, 0, 1, ksize=3)
-    sobel_x = cv2.Sobel(bridge_patch, cv2.CV_32F, 1, 0, ksize=3)
-    mean_sy = float(np.mean(np.abs(sobel_y)))
-    mean_sx = float(np.mean(np.abs(sobel_x)))
-
-    # Kiểm tra vết trũng tối (dark valley) theo chiều dọc (đặc trưng thanh ngang gọng kính)
-    row_means = np.mean(bridge_patch, axis=1)
-    min_idx = int(np.argmin(row_means))
-    has_valley = False
-    valley_depth = 0.0
-    if 1 < min_idx < len(row_means) - 2:
-        top_diff = row_means[0] - row_means[min_idx]
-        bot_diff = row_means[-1] - row_means[min_idx]
-        valley_depth = float(min(top_diff, bot_diff))
-        if valley_depth >= 8.0:
-            has_valley = True
-
-    sy_sx_ratio = mean_sy / (mean_sx + 1e-6)
-    # Cạnh ngang của gọng kính phải rõ nét và không bị lấn át bởi gờ sống mũi dọc
-    has_bridge = bool((has_valley and mean_sy >= 26.0) or (mean_sy >= 48.0 and sy_sx_ratio >= 0.50))
-    return has_bridge, mean_sy
-
-
-_GLOBAL_CNN = None
-_GLOBAL_CNN_LOADING = False
-_GLOBAL_CNN_LOCK = threading.Lock()
+    return cv2.resize(gray[y0:y1, x0:x1], (size, size)).astype(np.float32) / 255.0
 
 
 def load_eye_cnn():
@@ -283,7 +169,6 @@ def load_eye_cnn():
         return None
     try:
         import tensorflow as tf
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
         model = tf.keras.models.load_model(EYE_MODEL_PATH)
         fn = tf.function(
             lambda x: model(x, training=False),
@@ -294,34 +179,6 @@ def load_eye_cnn():
     except Exception as e:  # noqa: BLE001
         print("Không nạp được CNN:", e)
         return None
-
-
-def get_cached_eye_cnn_nonblocking():
-    """Lấy CNN đã nạp hoặc kích hoạt nạp nền bất đồng bộ để camera không phải chờ."""
-    global _GLOBAL_CNN, _GLOBAL_CNN_LOADING
-    if _GLOBAL_CNN is not None:
-        return _GLOBAL_CNN
-    with _GLOBAL_CNN_LOCK:
-        if _GLOBAL_CNN is not None:
-            return _GLOBAL_CNN
-        if not _GLOBAL_CNN_LOADING:
-            _GLOBAL_CNN_LOADING = True
-
-            def _loader():
-                global _GLOBAL_CNN, _GLOBAL_CNN_LOADING
-                try:
-                    m = load_eye_cnn()
-                    with _GLOBAL_CNN_LOCK:
-                        _GLOBAL_CNN = m
-                finally:
-                    _GLOBAL_CNN_LOADING = False
-
-            threading.Thread(target=_loader, name="Preload-CNN-Worker", daemon=True).start()
-    return _GLOBAL_CNN
-
-
-# Tự động kích hoạt nạp trước CNN ngay khi vừa mở ứng dụng
-get_cached_eye_cnn_nonblocking()
 
 
 # ----------------------------------------------------------------------------
@@ -353,6 +210,7 @@ class DrowsyProcessor(VideoProcessorBase):
         self._ready = threading.Event()
         self.overlay = None
         self._worker = None
+        self.hands = None
         self.reset_session(reset_pose=True)
         self._start_worker()
 
@@ -372,32 +230,28 @@ class DrowsyProcessor(VideoProcessorBase):
             self.yawn_recovered_since = None
             self.last_yawn_event_at = -1e9
             self.open_ear_samples = collections.deque(maxlen=90)
-            self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.76
+            self.open_ear_ref = None
             self.eye_open_since = None
-            self.eye_open_candidate_since = None
             self.eye_closed_count = 0
             self.eye_state_closed = False
-            self.eye_confident = True
+            self.eye_confident = False
             self.session_started_at = time.time()
             self.face_missing_since = None
             self.closed_since = None
             self.yawn_since = None
             self.yawn_counted = False
             self.yawn_times = collections.deque()
+            self.last_yawn_type = ""
+            self.open_yawns_count = 0
+            self.covered_yawns_count = 0
+            self.covered_yawn_since = None
+            self.covered_yawn_counted = False
+            self.hand_near_mouth = False
             self.nod_since = None
             self.nod_counted = False
             self.nod_times = collections.deque()
             self.drowsy_since = None
             self.drowsy_until = 0.0
-            self.distracted_since = None
-            self.distracted_until = 0.0
-            self.distracted = False
-            self.distracted_counted = False
-            self.distraction_times = collections.deque()
-            self.mask_detected = False
-            self.glasses_detected = False
-            self.glasses_active = False
-            self.glasses_hist = collections.deque(maxlen=25)
             self.reason = ""
             self.score = 0.0
             self.risk_level = "Tỉnh táo"
@@ -419,11 +273,10 @@ class DrowsyProcessor(VideoProcessorBase):
     def _empty_stats(self):
         return dict(
             face=False, drowsy=False, reason="", risk_level="Chưa đủ dữ liệu", score=0.0,
-            distracted=False, distracted_for=0.0, distractions=0, mask_detected=False,
-            glasses_detected=False, glasses_active=False, glasses_cfg=self.cfg.get("glasses_mode", "auto"),
             perclos=0.0, perclos_ready=False, ear=0.0, mar=0.0,
             pitch_dev=0.0, yaw_dev=0.0, yawns=0, nods=0,
             closed=False, eye_valid=False, eye_confident=False, mouth_valid=False,
+            yawn_type="", open_yawns=0, covered_yawns=0, hand_near_mouth=False,
             blinks=0, slow_closures=0, recent_eye_ratio=0.0, eye_closed_for=0.0,
             alarm_evidence="",
             brightness=0.0, eye_contrast=0.0, observation_quality=0.0,
@@ -435,7 +288,7 @@ class DrowsyProcessor(VideoProcessorBase):
             frame_seq=0, sampled_at=0.0, inference_completed_at=0.0,
             sample_age_ms=0.0, inference_delay_ms=0.0, queue_ms=0.0,
             stale=False, live=False,
-            source="CNN + EAR" if self.cnn else ("Đang nạp" if not self._model_ready else "EAR"),
+            source="CNN chính · EAR theo dõi" if self.cnn else ("Đang nạp" if not self._model_ready else "EAR"),
         )
 
     def reset_baseline(self):
@@ -481,13 +334,21 @@ class DrowsyProcessor(VideoProcessorBase):
                     max_num_faces=1, refine_landmarks=False,
                     min_detection_confidence=0.5, min_tracking_confidence=0.5,
                 )
-            self.cnn = get_cached_eye_cnn_nonblocking()
-            self._model_ready = self.cnn is not None
+            if self.hands is None:
+                try:
+                    self.hands = mp.solutions.hands.Hands(
+                        static_image_mode=False,
+                        max_num_hands=2,
+                        min_detection_confidence=0.45,
+                        min_tracking_confidence=0.45,
+                    )
+                except Exception as he:
+                    print("Không khởi tạo được MediaPipe Hands:", repr(he))
+                    self.hands = None
+            if not self._model_ready:
+                self.cnn = load_eye_cnn()
+                self._model_ready = True
             while True:
-                if self.cnn is None:
-                    self.cnn = get_cached_eye_cnn_nonblocking()
-                    if self.cnn is not None:
-                        self._model_ready = True
                 # Nhận frame mới nhất: mọi frame cũ đến khi inference đang bận sẽ được bỏ qua.
                 # Không tạo queue dài và không làm tăng thời gian chờ video.
                 self._ready.wait(timeout=0.5)
@@ -497,7 +358,7 @@ class DrowsyProcessor(VideoProcessorBase):
                     self._ready.clear()
                     idle = time.perf_counter() - self._last_receive
                 if item is None:
-                    if idle > 90.0:
+                    if idle > 8.0:
                         break
                     continue
                 img, sampled_at, captured_mono, frame_seq = item
@@ -515,6 +376,12 @@ class DrowsyProcessor(VideoProcessorBase):
                 except Exception:
                     pass
                 self.mesh = None
+            if self.hands is not None:
+                try:
+                    self.hands.close()
+                except Exception:
+                    pass
+                self.hands = None
 
     def recv(self, frame):
         """Camera không chờ AI; giữ hộp xuyên suốt giữa các snapshot AI.
@@ -535,7 +402,7 @@ class DrowsyProcessor(VideoProcessorBase):
             self._camera_seq += 1
             frame_seq = self._camera_seq
             # Mailbox 1 chỗ: thay frame cũ, không có hàng đợi tồn đọng.
-            self._pending = (img, now, t, frame_seq)
+            self._pending = (img.copy(), now, t, frame_seq)
             self._last_receive = t
             overlay = self.overlay
         self._ready.set()
@@ -552,27 +419,11 @@ class DrowsyProcessor(VideoProcessorBase):
                     draw_color = C_SKIP if age > OVERLAY_DIM_AFTER_S else color
                     cv2.rectangle(img, tuple(coords[:2]), tuple(coords[2:]), draw_color, 2, cv2.LINE_AA)
                 if overlay.get("alarm") and age <= OVERLAY_DIM_AFTER_S:
-                    cv2.rectangle(img, (0, 0), (img.shape[1]-1, img.shape[0]-1), C_BAD, 4)
-                    cv2.putText(img, "CANH BAO BUON NGU!", (12, 38),
-                                cv2.FONT_HERSHEY_SIMPLEX, .78, C_BAD, 2, cv2.LINE_AA)
-                elif overlay.get("distracted") and age <= OVERLAY_DIM_AFTER_S:
-                    cv2.rectangle(img, (0, 0), (img.shape[1]-1, img.shape[0]-1), (40, 140, 255), 4)
-                    cv2.putText(img, "CANH BAO MAT TAP TRUNG!", (12, 38),
-                                cv2.FONT_HERSHEY_SIMPLEX, .78, (40, 140, 255), 2, cv2.LINE_AA)
-                elif overlay.get("closed_sec", 0.0) >= 0.35 and age <= OVERLAY_DIM_AFTER_S:
-                    c_sec = overlay["closed_sec"]
-                    cv2.putText(img, f"Nham mat: {c_sec:.1f}s", (12, 38),
-                                cv2.FONT_HERSHEY_SIMPLEX, .70, C_WARN, 2, cv2.LINE_AA)
-                elif overlay.get("distracted_sec", 0.0) >= 0.8 and age <= OVERLAY_DIM_AFTER_S:
-                    d_sec = overlay["distracted_sec"]
-                    cv2.putText(img, f"Lech huong: {d_sec:.1f}s", (12, 38),
-                                cv2.FONT_HERSHEY_SIMPLEX, .70, (40, 140, 255), 2, cv2.LINE_AA)
-                if overlay.get("glasses_active") and age <= OVERLAY_DIM_AFTER_S:
-                    cv2.putText(img, "KINH MAT", (img.shape[1] - 110, 26),
-                                cv2.FONT_HERSHEY_SIMPLEX, .48, (242, 184, 75), 1, cv2.LINE_AA)
+                    cv2.rectangle(img, (0, 0), (img.shape[1]-1, img.shape[0]-1), C_BAD, 3)
+                    draw_camera_alert(img)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    def _eye_closed(self, right_crop, left_crop, ear, eye_valid, glasses_active=False):
+    def _eye_closed(self, right_crop, left_crop, ear, eye_valid):
         """Phân loại mắt từ crop đã tính sẵn để tránh crop/resize hai lần mỗi frame."""
         self.right_closed_prob = None
         self.left_closed_prob = None
@@ -590,9 +441,7 @@ class DrowsyProcessor(VideoProcessorBase):
             return self.eye_state_closed
 
         if self.cnn is None:
-            fallback_thr = float(self.cfg.get("ear_thr", 0.21))
-            base_ref = self.open_ear_ref if self.open_ear_ref is not None else (fallback_thr / 0.78)
-            ear_threshold = (0.72 * base_ref) if glasses_active else (0.78 * base_ref)
+            ear_threshold = (0.74 * self.open_ear_ref) if self.open_ear_ref is not None else self.cfg["ear_thr"]
             self.eye_state_closed = ear < ear_threshold
             self.eye_confident = True
             self.cnn_ms = 0.0
@@ -629,74 +478,29 @@ class DrowsyProcessor(VideoProcessorBase):
         else:
             smooth_prob = 0.75 * self.eye_prob_hist[-1] + 0.25 * self.eye_prob_hist[-2]
 
-        # Xác định mốc tham chiếu EAR (cá nhân hoặc fallback)
-        fallback_thr = float(self.cfg.get("ear_thr", 0.21))
-        default_ref = fallback_thr / 0.76
-        base_ref = self.open_ear_ref if self.open_ear_ref is not None else default_ref
-
-        min_p = float(np.min(closed_prob)) if len(closed_prob) else smooth_prob
-        max_p = float(np.max(closed_prob)) if len(closed_prob) else smooth_prob
-        mean_p = smooth_prob
-
-        # Tỷ lệ EAR hiện tại so với lúc mắt mở bình thường
-        ear_ratio = ear / max(base_ref, 0.01)
-
-        if glasses_active:
-            # === CHẾ ĐỘ KÍNH MẮT ===
-            # Kết hợp đa tín hiệu bù trừ cho gọng kính và tròng kính:
-            # 1. Rõ ràng MỞ (Tỉnh táo): EAR đạt >= 80% baseline và CNN không báo nhắm quá cao
-            if (ear_ratio >= 0.80 and mean_p <= 0.68) or (mean_p <= 0.28 and ear_ratio >= 0.72):
-                self.eye_state_closed = False
-                self.eye_confident = True
-            # 2. Rõ ràng NHẮM (Buồn ngủ / Ngủ gật): EAR sụt giảm rõ rệt (> 36%) hoặc CNN báo nhắm rất cao
-            elif ear_ratio <= 0.64 or ear <= 0.13:
-                self.eye_state_closed = True
-                self.eye_confident = True
-            elif mean_p >= 0.78 and ear_ratio <= 0.78:
-                self.eye_state_closed = True
-                self.eye_confident = True
-            elif mean_p >= 0.85:
-                self.eye_state_closed = True
-                self.eye_confident = True
-            # 3. Vùng trung gian: cả EAR giảm và CNN cùng nghiêng về nhắm
-            elif ear_ratio <= 0.72 and mean_p >= 0.45:
-                self.eye_state_closed = True
-                self.eye_confident = True
-            # 4. Hysteresis giữ trạng thái chống rung nhấp nháy
-            elif self.eye_state_closed:
-                # Đang nhắm: chỉ mở lại khi mắt mở rõ ràng
-                self.eye_state_closed = not (ear_ratio >= 0.78 and mean_p <= 0.52)
-                self.eye_confident = True
-            else:
-                self.eye_state_closed = bool(mean_p >= 0.60 and ear_ratio <= 0.75)
-                self.eye_confident = True
+        # Bằng chứng nhắm: (1) cả HAI mắt CNN đóng, (2) EAR giảm so với mốc
+        # mở mắt cá nhân. Chặn lỗi Kaggle->webcam gây P(Closed) 90% khi mắt mở.
+        ear_ref = self.open_ear_ref
+        bilateral_close = (len(closed_prob) == 2 and
+                           float(np.min(closed_prob)) >= 0.60 and smooth_prob >= 0.72)
+        if getattr(self, "EYE_DECISION_POLICY", "legacy") == "cnn_primary_v1":
+            self.eye_state_closed, self.eye_confident, self._cnn_rule = cnn_eye_decision(
+                list(closed_prob), smooth_prob, self.eye_state_closed)
+        elif ear_ref is None:
+            self.eye_state_closed = False
+            self.eye_confident = False   # chưa chuẩn hóa mắt: không phán đoán
+        elif ear >= 0.82 * ear_ref:
+            self.eye_state_closed = False
+            self.eye_confident = True
+        elif ear <= 0.74 * ear_ref and bilateral_close:
+            self.eye_state_closed = True
+            self.eye_confident = True
+        elif smooth_prob <= 0.35 and ear > 0.74 * ear_ref:
+            self.eye_state_closed = False
+            self.eye_confident = True
         else:
-            # === CHẾ ĐỘ TIÊU CHUẨN (KHÔNG ĐEO KÍNH) ===
-            ear_close_thr = 0.78 * base_ref
-            ear_open_thr = 0.86 * base_ref
-
-            ear_closed_signal = (ear <= ear_close_thr) and (mean_p >= 0.35)
-            cnn_closed_signal = (mean_p >= 0.58 and ear <= ear_open_thr) or (max_p >= 0.75 and ear <= ear_open_thr)
-            deep_closed_signal = ear <= (0.68 * base_ref) or ear <= 0.13
-
-            clearly_open = (ear >= ear_open_thr) and (mean_p <= 0.55)
-
-            if clearly_open:
-                self.eye_state_closed = False
-                self.eye_confident = True
-            elif deep_closed_signal or ear_closed_signal or cnn_closed_signal:
-                self.eye_state_closed = True
-                self.eye_confident = True
-            elif mean_p <= 0.28 and ear > ear_close_thr:
-                self.eye_state_closed = False
-                self.eye_confident = True
-            elif self.eye_state_closed:
-                self.eye_state_closed = not (ear >= 0.82 * base_ref and mean_p <= 0.48)
-                self.eye_confident = True
-            else:
-                # Vùng chuyển tiếp / nửa nhắm nửa mở
-                self.eye_state_closed = bool(ear <= ear_close_thr or mean_p >= 0.50)
-                self.eye_confident = True
+            self.eye_state_closed = False
+            self.eye_confident = False
 
         return self.eye_state_closed
 
@@ -755,7 +559,7 @@ class DrowsyProcessor(VideoProcessorBase):
         # nên có thể quy đổi trực tiếp về frame hiển thị 640x360.
         if w > MP_PROCESS_WIDTH:
             scale = MP_PROCESS_WIDTH / float(w)
-            small = cv2.resize(img, (MP_PROCESS_WIDTH, max(1, int(h * scale))), interpolation=cv2.INTER_LINEAR)
+            small = cv2.resize(img, (MP_PROCESS_WIDTH, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
         else:
             small = img
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -770,22 +574,17 @@ class DrowsyProcessor(VideoProcessorBase):
             self.fps = 0.82 * self.fps + 0.18 * inst_fps if self.fps else inst_fps
 
         if not res.multi_face_landmarks:
+            self.closed_since = self.yawn_since = self.nod_since = None
+            self.drowsy_until = 0.0
+            self.drowsy_since = None
+            self.eye_open_since = None
+            self.last_eye_sample_at = None
+            self.eye_prob_hist.clear()
+            self.cnn_ms = 0.0
             if self.face_missing_since is None:
                 self.face_missing_since = now
-            missing_dur = now - self.face_missing_since
-
-            # Nếu chỉ rớt 1-2 khung hình ngắn (< 0.55s), giữ nguyên trạng thái nhắm mắt
-            # không xóa timers đột ngột để chống đứt đoạn khi buồn ngủ / gật đầu
-            if missing_dur >= 0.55:
-                self.closed_since = self.yawn_since = self.nod_since = None
-                self.drowsy_since = None
-                self.eye_open_since = None
-                self.last_eye_sample_at = None
-                self.eye_prob_hist.clear()
-                self.cnn_ms = 0.0
-
-            if missing_dur >= 1.5:
-                # Nếu camera mất khuôn mặt lâu (> 1.5s), mới dọn dẹp lịch sử tích lũy
+            elif now - self.face_missing_since >= 1.0:
+                # Nếu camera mất khuôn mặt lâu, không kế thừa số liệu cũ.
                 self.eye_hist.clear()
                 self.eye_closed_count = 0
                 self.blink_times.clear()
@@ -797,22 +596,22 @@ class DrowsyProcessor(VideoProcessorBase):
                 self.baseline, self.yaw_baseline = None, None
                 self.pitch_buf.clear()
                 self.yaw_buf.clear()
-                if missing_dur >= 2.5:
+                if now - self.face_missing_since >= 2.0:
                     self.open_ear_samples.clear()
-                    self.open_ear_ref = float(self.cfg.get("ear_thr", 0.21)) / 0.76
-
+                    self.open_ear_ref = None
             self.processing_ms = (time.perf_counter() - t_frame) * 1000.0
             self._push(dict(face=False, risk_level="Không thấy khuôn mặt"),
                        now, cfg, captured_mono, frame_seq, queue_ms)
             with self.lock:
+                # Ngắt một frame FaceMesh không làm hộp biến mất rồi nháy lên.
+                # Sau 0.5 s không thấy mặt mới thật sự xóa hộp.
                 if (self.overlay is None or
                     time.perf_counter() - self.last_face_overlay_mono > OVERLAY_MISSING_GRACE_S):
                     self.overlay = {"finished_mono": time.perf_counter(),
                                     "capture_mono": captured_mono, "frame_seq": frame_seq,
-                                    "boxes": (), "alarm": False, "closed_sec": 0.0}
+                                    "boxes": (), "alarm": False}
                 elif self.overlay is not None:
-                    keep_alarm = bool(now < self.drowsy_until)
-                    self.overlay = {**self.overlay, "alarm": keep_alarm}
+                    self.overlay = {**self.overlay, "alarm": False}
             return
         self.face_missing_since = None
 
@@ -832,90 +631,87 @@ class DrowsyProcessor(VideoProcessorBase):
         if pose is not None:
             pitch, yaw, _ = pose
 
-        if pitch is not None and yaw is not None:
+        if pitch is not None and yaw is not None and self.baseline is None:
             self.pitch_buf.append(pitch)
             self.yaw_buf.append(yaw)
-            if self.baseline is None and len(self.pitch_buf) >= POSE_INIT_SAMPLES:
-                self.baseline = float(np.median(self.pitch_buf))
-                self.yaw_baseline = float(np.median(self.yaw_buf))
-            elif self.baseline is not None and len(self.pitch_buf) > 60:
-                self.pitch_buf.pop(0)
-                self.yaw_buf.pop(0)
+            if len(self.pitch_buf) >= 45:
                 self.baseline = float(np.median(self.pitch_buf))
                 self.yaw_baseline = float(np.median(self.yaw_buf))
 
         pitch_dev = (pitch - self.baseline) if (pitch is not None and self.baseline is not None) else 0.0
         yaw_dev = (yaw - self.yaw_baseline) if (yaw is not None and self.yaw_baseline is not None) else 0.0
 
-        # Nhận diện kính mắt (tự động hoặc theo cấu hình)
-        glasses_cfg = cfg.get("glasses_mode", "auto")
-        has_glasses_bridge, bridge_edge_score = check_glasses_features(gray, pts)
-        self.glasses_hist.append(int(has_glasses_bridge))
-        glasses_ratio = sum(self.glasses_hist) / len(self.glasses_hist) if self.glasses_hist else 0.0
-        if glasses_ratio >= 0.65:
-            self.glasses_detected = True
-        elif glasses_ratio <= 0.25:
-            self.glasses_detected = False
+        # Nhận diện bàn tay trên frame thu nhỏ để phát hiện che miệng (Hand Occlusion)
+        hand_res = None
+        if getattr(self, "hands", None) is not None and cfg.get("detect_covered_yawn", True):
+            try:
+                hand_res = self.hands.process(rgb_small)
+            except Exception:
+                hand_res = None
 
-        if glasses_cfg == "on":
-            glasses_active = True
-        elif glasses_cfg == "off":
-            glasses_active = False
-        else:
-            glasses_active = bool(self.glasses_detected)
-        self.glasses_active = glasses_active
+        hand_near_mouth = False
+        hand_box = None
+        if hand_res and hand_res.multi_hand_landmarks:
+            mouth_w = float(np.linalg.norm(pts[78] - pts[308]))
+            mouth_cx = float((pts[78, 0] + pts[308, 0]) / 2.0)
+            mouth_cy = float((pts[13, 1] + pts[14, 1]) / 2.0)
+            
+            mouth_x_min = float(min(pts[78, 0], pts[61, 0]) - 0.35 * mouth_w)
+            mouth_x_max = float(max(pts[308, 0], pts[291, 0]) + 0.35 * mouth_w)
+            mouth_y_min = float(pts[2, 1] - 0.15 * mouth_w)
+            mouth_y_max = float(pts[152, 1] + 0.20 * mouth_w)
+            
+            for h_lm in hand_res.multi_hand_landmarks:
+                h_pts = [(p.x * w, p.y * h) for p in h_lm.landmark]
+                key_indices = [0, 4, 8, 9, 12, 16, 20]
+                pts_in = sum(1 for idx in key_indices if mouth_x_min <= h_pts[idx][0] <= mouth_x_max and mouth_y_min <= h_pts[idx][1] <= mouth_y_max)
+                d_center = min(np.hypot(h_pts[idx][0] - mouth_cx, h_pts[idx][1] - mouth_cy) for idx in [4, 8, 9, 12])
+                
+                if pts_in >= 2 or d_center <= 0.85 * mouth_w:
+                    hand_near_mouth = True
+                    hx_all = [h_pts[idx][0] for idx in key_indices if mouth_x_min <= h_pts[idx][0] <= mouth_x_max and mouth_y_min <= h_pts[idx][1] <= mouth_y_max]
+                    hy_all = [h_pts[idx][1] for idx in key_indices if mouth_x_min <= h_pts[idx][0] <= mouth_x_max and mouth_y_min <= h_pts[idx][1] <= mouth_y_max]
+                    if hx_all and hy_all:
+                        hand_box = (max(0, int(min(hx_all)) - 10), max(0, int(min(hy_all)) - 10),
+                                    min(w - 1, int(max(hx_all)) + 10), min(h - 1, int(max(hy_all)) + 10))
+                    break
+        self.hand_near_mouth = hand_near_mouth
 
-        # Crop đúng một lần/frame; dùng chung cho kiểm tra chất lượng và CNN
-        right_crop_q = crop_eye(gray, pts[RIGHT_EYE], enhance=False)
-        left_crop_q = crop_eye(gray, pts[LEFT_EYE], enhance=False)
+        # Crop đúng một lần/frame; dùng chung cho kiểm tra chất lượng và CNN.
+        right_crop_q = crop_eye(gray, pts[RIGHT_EYE])
+        left_crop_q = crop_eye(gray, pts[LEFT_EYE])
         contrasts = [float(np.std(c * 255.0)) for c in (right_crop_q, left_crop_q) if c is not None]
         eye_contrast = float(np.mean(contrasts)) if contrasts else 0.0
 
-        yaw_ok = self.yaw_baseline is None or abs(yaw_dev) <= (cfg["yaw_limit"] + 5.0)
-        light_ok = (cfg["min_brightness"] - 10.0) <= brightness <= (cfg["max_brightness"] + 15.0)
-        # Độ tương phản mắt: nếu mắt đang nhắm thì tương phản tự nhiên giảm.
-        # Chỉ loại bỏ nếu crop hoàn toàn đen/hỏng (std < 1.0)
-        contrast_ok = eye_contrast >= min(cfg["min_eye_contrast"], 1.5)
+        yaw_ok = self.yaw_baseline is None or abs(yaw_dev) <= cfg["yaw_limit"]
+        light_ok = cfg["min_brightness"] <= brightness <= cfg["max_brightness"]
+        contrast_ok = eye_contrast >= cfg["min_eye_contrast"]
         eye_valid = bool(yaw_ok and light_ok and contrast_ok)
 
-        # Kiểm tra khẩu trang / che miệng
-        mouth_pts_box = pts[[MOUTH["left"], MOUTH["top"], MOUTH["right"], MOUTH["bottom"]]]
-        mouth_crop_q = crop_eye(gray, mouth_pts_box, size=48)
-        mouth_contrast = float(np.std(mouth_crop_q * 255.0)) if mouth_crop_q is not None else 0.0
-        # Vùng miệng nếu bị che phẳng hoặc đeo khẩu trang, độ tương phản rất thấp (< 3.2)
-        mask_detected = bool(mouth_crop_q is not None and mouth_contrast < 3.2 and light_ok)
-        self.mask_detected = mask_detected
-
-        # Miệng chỉ đáng tin khi mặt không quay quá lớn, ánh sáng chấp nhận được và không bị che / khẩu trang.
-        mouth_valid = bool(light_ok and not mask_detected and (self.yaw_baseline is None or abs(yaw_dev) <= 30.0))
+        # Miệng chỉ đáng tin khi mặt không quay quá lớn và ánh sáng chấp nhận được.
+        # Lưu ý: đây KHÔNG phải bộ phát hiện khẩu trang. Nếu đeo khẩu trang, nhánh ngáp
+        # nên được xem là không đáng tin trong thực nghiệm và không được dùng để kết luận đơn lẻ.
+        mouth_valid = bool(light_ok and (self.yaw_baseline is None or abs(yaw_dev) <= 30.0))
 
         quality_parts = [float(yaw_ok), float(light_ok), float(contrast_ok)]
         observation_quality = float(np.mean(quality_parts))
 
-        # Tự động cập nhật baseline EAR mở mắt khi mắt mở rõ (không lấy mẫu khi đang nhắm mắt)
-        # Hỗ trợ tự nhiên cho mọi người dùng (mắt to, mắt nhỏ, mắt một mí, đeo kính cận)
-        mean_p_raw = float(np.mean(self.eye_prob_hist)) if self.eye_prob_hist else 0.5
-        allow_ear_sample = bool(
-            not self.eye_state_closed and mean_p_raw <= 0.48 and ear >= 0.18
-        )
-        if (eye_valid and 0.18 <= ear <= 0.45 and allow_ear_sample):
+        if (eye_valid and 0.12 <= ear <= 0.40 and
+            (self.open_ear_ref is None or ear >= 0.78 * self.open_ear_ref) and
+            (now - self.session_started_at <= 3.5 or not self.eye_state_closed)):
             self.open_ear_samples.append(ear)
             if len(self.open_ear_samples) >= 8:
-                est = float(np.percentile(self.open_ear_samples, 85))
-                # Cập nhật mượt mà (smooth exponential) để thích ứng cả khi người dùng đổi tư thế
-                if self.open_ear_ref is None:
-                    self.open_ear_ref = est
-                else:
-                    self.open_ear_ref = 0.88 * self.open_ear_ref + 0.12 * est
+                est = float(np.percentile(self.open_ear_samples, 70))
+                # Không cập nhật baseline xuống trong lúc mắt có thể đang nhắm.
+                self.open_ear_ref = max(self.open_ear_ref or 0, est)
 
-        closed = bool(self._eye_closed(right_crop_q, left_crop_q, ear, eye_valid=eye_valid, glasses_active=glasses_active))
+        closed = bool(self._eye_closed(right_crop_q, left_crop_q, ear, eye_valid=eye_valid))
 
         # PERCLOS chỉ dùng frame: đủ sáng/góc/tương phản + CNN đủ tự tin.
         # Khởi tạo baseline trước khi đưa frame vào PERCLOS để tránh nhiễu lúc camera/model vừa khởi động.
-        # PERCLOS và thời gian nhắm: đo ngay khi frame hợp lệ và có tín hiệu
         eye_measure_valid = bool(
-            eye_valid and self.eye_confident
-            and (now - self.session_started_at >= 0.5)
+            eye_valid and self.eye_confident and (self.open_ear_ref is not None or getattr(self, "EYE_DECISION_POLICY", "legacy") == "cnn_primary_v1")
+            and (now - self.session_started_at >= 1.5)
         )
         if eye_measure_valid:
             self.eye_hist.append((now, closed))
@@ -931,33 +727,29 @@ class DrowsyProcessor(VideoProcessorBase):
             span, perclos = 0.0, 0.0
         perclos_ready = span >= min(10.0, cfg["window"] * 0.5) and len(self.eye_hist) >= 30
 
-        # Ghi nhận nhắm mắt dựa vào thời gian thực, có dung sai 0.30s chống rớt frame
+        # Ghi nhận nhắm mắt/chớp mắt dựa vào THỜI GIAN THỰC, không dựa số frame.
+        # Một chớp mắt thông thường không bao giờ đủ điều kiện tự phát cảnh báo.
         if eye_measure_valid:
-            if self.last_eye_sample_at is not None and now - self.last_eye_sample_at > 0.85:
+            if self.last_eye_sample_at is not None and now - self.last_eye_sample_at > 0.48:
+                # Mất frame giữa chừng => không giả định nhắm liên tục.
                 self.closed_since = None
-                self.eye_open_candidate_since = None
             self.last_eye_sample_at = now
             if closed:
                 self.closed_since = self.closed_since or now
-                self.eye_open_candidate_since = None
                 self.eye_open_since = None
             else:
-                if self.eye_open_candidate_since is None:
-                    self.eye_open_candidate_since = now
-                if now - self.eye_open_candidate_since >= 0.30:
-                    if self.closed_since is not None:
-                        duration = now - self.closed_since
-                        if 0.10 <= duration < 0.65:
-                            self.blink_times.append(now)
-                        elif 0.65 <= duration <= 8.0:
-                            self.slow_closure_times.append(now)
-                    self.closed_since = None
-                    self.eye_open_since = self.eye_open_since or now
-        else:
-            if self.last_eye_sample_at is not None and now - self.last_eye_sample_at > 0.85:
+                if self.closed_since is not None:
+                    duration = now - self.closed_since
+                    if 0.10 <= duration < 0.65:
+                        self.blink_times.append(now)
+                    elif 0.65 <= duration <= 8.0:
+                        self.slow_closure_times.append(now)
                 self.closed_since = None
-                self.eye_open_since = None
-                self.eye_open_candidate_since = None
+                self.eye_open_since = self.eye_open_since or now
+        else:
+            self.closed_since = None
+            self.eye_open_since = None
+            self.last_eye_sample_at = None
 
         for events in (self.blink_times, self.slow_closure_times):
             while events and now - events[0] > 60.0:
@@ -967,18 +759,37 @@ class DrowsyProcessor(VideoProcessorBase):
         closed_long = bool(eye_measure_valid and closed and
                            eye_closed_for >= cfg["closed_sec"])
 
-        # Ngáp: MAR phải duy trì đủ lâu, miệng phải đóng rõ mới được đếm lần sau;
-        # thêm cooldown để nói chuyện/há miệng không làm tăng sự kiện quá nhanh.
-        yawn_active = bool(mouth_valid and mar >= cfg["mar_thr"])
-        if yawn_active:
+        # 1. Ngáp mở miệng truyền thống (Open Yawn)
+        open_yawn_active = bool(mouth_valid and mar >= cfg["mar_thr"] and not hand_near_mouth)
+        
+        # 2. Ngáp che miệng (Covered-Mouth Yawn)
+        # Kết hợp: Bàn tay che vùng miệng + Phản xạ nheo mắt/nhắm mắt khi ngáp (Eye squinting) + Đầu nhìn phía trước
+        eye_squint = bool(
+            closed or 
+            ear <= 0.18 or 
+            (self.open_ear_ref is not None and ear <= 0.76 * self.open_ear_ref) or
+            (len(self.eye_prob_hist) > 0 and self.eye_prob_hist[-1] >= 0.48)
+        )
+        head_aligned = bool(self.yaw_baseline is None or abs(yaw_dev) <= 28.0)
+        
+        covered_yawn_active = bool(
+            cfg.get("detect_covered_yawn", True) and
+            hand_near_mouth and 
+            eye_squint and 
+            head_aligned
+        )
+
+        if open_yawn_active:
             self.yawn_recovered_since = None
             self.yawn_since = self.yawn_since or now
             if (now - self.yawn_since >= cfg["yawn_sec"] and
                 not self.yawn_counted and now - self.last_yawn_event_at >= 3.0):
                 self.yawn_times.append(now)
                 self.last_yawn_event_at = now
+                self.last_yawn_type = "open"
+                self.open_yawns_count += 1
                 self.yawn_counted = True
-        elif not mouth_valid:
+        elif not mouth_valid or hand_near_mouth:
             self.yawn_since = None
         elif mar <= 0.75 * cfg["mar_thr"]:
             self.yawn_recovered_since = self.yawn_recovered_since or now
@@ -986,8 +797,26 @@ class DrowsyProcessor(VideoProcessorBase):
                 self.yawn_since, self.yawn_counted = None, False
         else:
             self.yawn_since = None
+
+        covered_sec = float(cfg.get("covered_yawn_sec", 1.2))
+        if covered_yawn_active:
+            self.covered_yawn_since = self.covered_yawn_since or now
+            if (now - self.covered_yawn_since >= covered_sec and
+                not self.covered_yawn_counted and now - self.last_yawn_event_at >= 3.0):
+                self.yawn_times.append(now)
+                self.last_yawn_event_at = now
+                self.last_yawn_type = "covered"
+                self.covered_yawns_count += 1
+                self.covered_yawn_counted = True
+        else:
+            self.covered_yawn_since = None
+            if not hand_near_mouth:
+                self.covered_yawn_counted = False
+
         while self.yawn_times and now - self.yawn_times[0] > 60.0:
             self.yawn_times.popleft()
+
+        yawn_active = open_yawn_active or covered_yawn_active
 
         # Gật: phải giữ nghiêng đủ lâu và quay về mốc tư thế trước lần kế tiếp.
         # Không đếm các dao động qua lại gần ngưỡng như nhiều lần gật.
@@ -1012,36 +841,6 @@ class DrowsyProcessor(VideoProcessorBase):
         while self.nod_times and now - self.nod_times[0] > 60.0:
             self.nod_times.popleft()
 
-        # Kiểm tra mất tập trung (nhìn lệch hướng sang hai bên hoặc cúi nhìn điện thoại quá lâu)
-        distract_enabled = cfg.get("distraction_enabled", True)
-        distract_yaw_deg = float(cfg.get("distract_yaw_deg", 35.0))
-        distract_sec = float(cfg.get("distract_sec", 3.0))
-
-        head_away = bool(
-            distract_enabled and (
-                (self.yaw_baseline is not None and abs(yaw_dev) >= distract_yaw_deg) or
-                (self.baseline is not None and pitch_dev <= -24.0)
-            )
-        )
-        if head_away:
-            self.distracted_since = self.distracted_since or now
-            distracted_for = max(0.0, now - self.distracted_since)
-            if distracted_for >= distract_sec:
-                self.distracted_until = max(self.distracted_until, now + 1.80)
-                if not self.distracted_counted:
-                    self.distraction_times.append(now)
-                    self.distracted_counted = True
-        else:
-            self.distracted_since = None
-            self.distracted_counted = False
-
-        while self.distraction_times and now - self.distraction_times[0] > 60.0:
-            self.distraction_times.popleft()
-
-        distracted = bool(now < self.distracted_until)
-        distracted_for = (max(0.0, now - self.distracted_since)
-                          if self.distracted_since is not None else 0.0)
-
         recent_eye = [(t, c) for t, c in self.eye_hist
                       if 0 <= now - t <= EYE_RECENT_WINDOW_S]
         recent_eye_ready = bool(len(recent_eye) >= 12 and
@@ -1053,12 +852,12 @@ class DrowsyProcessor(VideoProcessorBase):
         nods_recent = sum(now - t <= EVENT_WINDOW_S for t in self.nod_times)
 
         # Chỉ đánh giá PERCLOS nếu lượng dữ liệu đủ và cả 8 giây gần đây cũng có
-        # dấu hiệu đóng mắt.
+        # dấu hiệu đóng mắt. Đòi ít nhất 2 lần đóng chậm hoặc tỷ lệ gần đây rất cao.
         eye_history_support = bool(
             perclos_ready and perclos >= cfg["perclos_thr"] and
             recent_eye_ready and
-            recent_eye_ratio >= max(0.18, cfg["perclos_thr"] * 0.70) and
-            (slow_count >= 1 or recent_eye_ratio >= max(0.26, cfg["perclos_thr"] * 0.85))
+            recent_eye_ratio >= max(0.22, cfg["perclos_thr"] * 0.75) and
+            (slow_count >= 2 or recent_eye_ratio >= 0.42)
         )
         if eye_history_support:
             self.perclos_high_since = self.perclos_high_since or now
@@ -1085,7 +884,7 @@ class DrowsyProcessor(VideoProcessorBase):
         )
         self.score = total_score
 
-        # C1..C4 so sánh chuẩn hóa: tín hiệu phụ chỉ được dùng khi cấu hình cho phép.
+        # C1..C4 vẫn so sánh công bằng: tín hiệu phụ chỉ được dùng khi cấu hình có nó.
         if cfg["config"] == "C1":
             combo_evidence = False
         elif cfg["config"] == "C2":
@@ -1099,7 +898,7 @@ class DrowsyProcessor(VideoProcessorBase):
             self.eye_open_since is not None and now - self.eye_open_since >= 0.75
         )
         # Khi đã mở mắt liên tục, PERCLOS cũ không còn được tự tạo cảnh báo.
-        # C4 vẫn có thể cảnh báo nếu ngay gần đây có hai loại sự kiện lặp lại.
+        # C4 vẫn có thể cảnh báo nếu *ngay gần đây* có hai loại sự kiện lặp lại.
         if open_confirmed:
             perclos_confirmed = False
             if not (cfg["config"] == "C4" and multi_aux_combination):
@@ -1112,24 +911,16 @@ class DrowsyProcessor(VideoProcessorBase):
         else:
             self.drowsy_since = None
 
-        # Nhắm mắt kéo dài hoặc gục đầu cúi sâu là trường hợp khẩn cấp
-        nod_down_long = bool(
-            self.baseline is not None and nod_active and self.nod_since is not None and
-            (now - self.nod_since >= max(1.8, cfg["nod_sec"] * 1.5))
-        )
+        # Một lần nhắm mắt thật sự kéo dài >= closed_sec là trường hợp nguy cấp.
+        # Các tổ hợp khác phải tồn tại ổn định và qua khoảng nghỉ sau cảnh báo.
         persistent_combo = bool(self.drowsy_since is not None and
                                 now - self.drowsy_since >= ALARM_EVIDENCE_HOLD_S)
         cooldown_ok = now - self.last_alarm_ended_at >= ALARM_COOLDOWN_S
-
-        # C1 chỉ mắt; C2 mắt + ngáp; C3 mắt + tư thế đầu; C4 toàn bộ
-        nod_emergency = bool(nod_down_long and (cfg["config"] in ("C3", "C4")))
-        new_alarm = bool(closed_long or nod_emergency or (cooldown_ok and persistent_combo))
+        new_alarm = bool(closed_long or (cooldown_ok and persistent_combo))
         if new_alarm:
             reasons = []
             if closed_long:
                 reasons.append("Nhắm mắt liên tục đủ lâu")
-            if nod_emergency:
-                reasons.append("Gục đầu cúi sâu kéo dài")
             elif perclos_confirmed:
                 reasons.append("PERCLOS cao kéo dài")
             if cfg["config"] in ("C2", "C4") and yawn_combination:
@@ -1139,9 +930,9 @@ class DrowsyProcessor(VideoProcessorBase):
             if cfg["config"] == "C4" and multi_aux_combination:
                 reasons.append("Ngáp và gật đầu đều lặp lại")
             self.reason = " · ".join(reasons) or "Nhiều dấu hiệu kéo dài"
-            self.drowsy_until = max(self.drowsy_until, now + 1.80)
+            self.drowsy_until = now + 0.70
 
-        if open_confirmed and not new_alarm and not (cfg["config"] == "C4" and multi_aux_combination) and not closed:
+        if open_confirmed and not new_alarm and not (cfg["config"] == "C4" and multi_aux_combination):
             # Tắt trạng thái nhanh khi mở mắt; dữ kiện lịch sử vẫn giữ để phân tích.
             self.drowsy_until = 0.0
         drowsy = bool(now < self.drowsy_until)
@@ -1150,30 +941,21 @@ class DrowsyProcessor(VideoProcessorBase):
         self.prev_drowsy = drowsy
 
         if drowsy:
-            risk_level = "Cảnh báo buồn ngủ"
-        elif distracted:
-            risk_level = "Cảnh báo mất tập trung"
+            risk_level = "Cảnh báo mạnh"
         elif closed or eye_history_support or repeated_eye or yawns_recent >= 2 or nods_recent >= 2:
-            risk_level = "Nguy cơ buồn ngủ" if eye_history_support or repeated_eye or closed else "Có dấu hiệu mệt"
-        elif distracted_for >= 1.0:
-            risk_level = "Đang nhìn lệch đường"
+            risk_level = "Nguy cơ buồn ngủ" if eye_history_support or repeated_eye else "Có dấu hiệu mệt"
         else:
             risk_level = "Tỉnh táo"
-        if not drowsy and not distracted and observation_quality < (2.0 / 3.0):
+        if not drowsy and observation_quality < (2.0 / 3.0):
             risk_level = "Quan sát chưa đủ tin cậy"
-        if not drowsy and not distracted and open_confirmed and not combo_evidence and not eye_history_support and not closed:
+        if not drowsy and open_confirmed and not combo_evidence and not eye_history_support:
             risk_level = "Tỉnh táo" if slow_count == 0 else "Có dấu hiệu mệt"
 
         self.risk_level = risk_level
         self.processing_ms = (time.perf_counter() - t_frame) * 1000.0
 
-        push_reason = self.reason if drowsy else ("Nhìn lệch hướng lái xe" if distracted else "")
         self._push(dict(
-            face=True, drowsy=drowsy, reason=push_reason,
-            distracted=distracted, distracted_for=distracted_for,
-            distractions=len(self.distraction_times), mask_detected=self.mask_detected,
-            glasses_detected=self.glasses_detected, glasses_active=self.glasses_active,
-            glasses_cfg=glasses_cfg,
+            face=True, drowsy=drowsy, reason=self.reason if drowsy else "",
             risk_level=risk_level, score=total_score,
             perclos=perclos, perclos_ready=perclos_ready,
             ear=ear, mar=mar, pitch_dev=pitch_dev, yaw_dev=yaw_dev,
@@ -1185,7 +967,13 @@ class DrowsyProcessor(VideoProcessorBase):
             recent_eye_ratio=recent_eye_ratio, eye_closed_for=eye_closed_for,
             alarm_evidence=self.reason if drowsy else ("Đang xác nhận dấu hiệu" if evidence_alarm else ""),
             eye_score=eye_score, yawn_score=yawn_score, nod_score=nod_score,
+            yawn_type=self.last_yawn_type,
+            open_yawns=self.open_yawns_count,
+            covered_yawns=self.covered_yawns_count,
+            hand_near_mouth=hand_near_mouth,
         ), now, cfg, captured_mono, frame_seq, queue_ms)
+
+        drowsy = bool(self.stats.get("exp_audio_on"))  # Camera alarm follows notification state.
 
         # Chỉ gửi tọa độ nhỏ sang callback video; không gửi frame đã xử lý.
         def box_xyxy(points, padding=5):
@@ -1200,8 +988,16 @@ class DrowsyProcessor(VideoProcessorBase):
         # có cảnh báo đã xác nhận; nhắm/ngáp đơn lẻ chỉ báo vàng (quan sát).
         eye_color = C_SKIP if not eye_valid else (C_BAD if drowsy else (C_WARN if closed else C_OK))
         mouth_pts = pts[[MOUTH["left"], MOUTH["top"], MOUTH["right"], MOUTH["bottom"]]]
-        mouth_color = C_SKIP if not mouth_valid else (C_BAD if drowsy and yawn_active else
+        mouth_color = C_SKIP if not mouth_valid else (C_BAD if (drowsy and yawn_active) else
                                                      (C_WARN if yawn_active else C_OK))
+        boxes_list = [
+            (box_xyxy(pts[RIGHT_EYE]), eye_color),
+            (box_xyxy(pts[LEFT_EYE]), eye_color),
+            (box_xyxy(mouth_pts, padding=6), mouth_color),
+        ]
+        if hand_box is not None:
+            boxes_list.append((hand_box, C_WARN if not drowsy else C_BAD))
+
         with self.lock:
             self.last_face_overlay_mono = time.perf_counter()
             self.overlay = {
@@ -1209,15 +1005,7 @@ class DrowsyProcessor(VideoProcessorBase):
                 "capture_mono": captured_mono,
                 "frame_seq": frame_seq,
                 "alarm": bool(drowsy),
-                "distracted": bool(distracted),
-                "closed_sec": eye_closed_for,
-                "distracted_sec": distracted_for,
-                "glasses_active": bool(self.glasses_active),
-                "boxes": (
-                    (box_xyxy(pts[RIGHT_EYE]), eye_color),
-                    (box_xyxy(pts[LEFT_EYE]), eye_color),
-                    (box_xyxy(mouth_pts, padding=6), mouth_color),
-                ),
+                "boxes": tuple(boxes_list),
             }
 
     def _push(self, data, now, cfg, captured_mono, frame_seq, queue_ms):
@@ -1239,12 +1027,14 @@ class DrowsyProcessor(VideoProcessorBase):
                 inference_delay_ms=(finished_mono - captured_mono) * 1000.0,
                 queue_ms=queue_ms,
                 _capture_mono=captured_mono,
-                source="CNN + EAR" if self.cnn else ("Đang nạp" if not self._model_ready else "EAR"),
+                source="CNN chính · EAR theo dõi" if self.cnn else ("Đang nạp" if not self._model_ready else "EAR"),
             )
             self.stats = base
             self._analysis_seq += 1
             self.history.append((now, base["perclos"], cfg["perclos_thr"], base["score"]))
             self._new_logs.append(dict(
+                **{name: base.get(name) for name in DIAGNOSTIC_FIELDS},
+                **{name: base.get(name) for name in EXPERIMENT_FIELDS},
                 frame_seq=frame_seq,
                 sample_time=round(now, 3), result_time=round(finished_wall, 3),
                 config=cfg["config"],
@@ -1263,9 +1053,6 @@ class DrowsyProcessor(VideoProcessorBase):
                 blinks=base["blinks"], slow_closures=base["slow_closures"],
                 recent_eye_ratio=base["recent_eye_ratio"],
                 eye_closed_for=base["eye_closed_for"],
-                distracted=base["distracted"],
-                distracted_for=base["distracted_for"],
-                mask_detected=base["mask_detected"],
                 alarm_evidence=base["alarm_evidence"],
                 left_p_closed=base["left_closed_prob"],
                 right_p_closed=base["right_closed_prob"],
@@ -1278,7 +1065,36 @@ class DrowsyProcessor(VideoProcessorBase):
 # ----------------------------------------------------------------------------
 # Giao diện Streamlit
 # ----------------------------------------------------------------------------
+class DiagnosticProcessor(EyeDiagnosticsMixin, DrowsyProcessor):
+    DIAGNOSTIC_MODEL_PATH = EYE_MODEL_PATH
+    DIAGNOSTIC_BASE_PATH = APP_PATH
+    DIAGNOSTIC_OUTPUT_ROOT = REPOSITORY_ROOT / "outputs/webcam_test"
+    EYE_DECISION_POLICY = "cnn_primary_v1"
+
+
+class ExperimentProcessor(ExperimentMixin, DiagnosticProcessor):
+    DIAGNOSTIC_OUTPUT_ROOT = REPOSITORY_ROOT / "outputs/c1_c4_experiments/webcam"
+
+
+DrowsyProcessor = ExperimentProcessor
 st.set_page_config(page_title="DrowsyAlert", page_icon="🌙", layout="wide")
+
+@st.cache_resource
+def _load_test_model():
+    loaded = load_eye_cnn()
+    if loaded is None:
+        raise RuntimeError(f"Không nạp được CNN. Đặt model đã bàn giao tại {TEAM_MODEL_PATH}. "
+                           f"Đường dẫn đang dùng: {EYE_MODEL_PATH}")
+    return loaded
+
+_TEST_CNN = _load_test_model()
+
+def load_eye_cnn():
+    return _TEST_CNN
+
+st.info("Thí nghiệm C1–C4: cùng CNN và PERCLOS theo thời gian. Nhánh nhắm liên tục 2 giây bật cảnh báo riêng, không chờ PERCLOS. "
+        "C2/C4 thông báo từ 2 lần ngáp trong 40 giây, không cần dấu hiệu mắt; mỗi ngáp mới thông báo một lần. "
+        "Nhánh PERCLOS cần ít nhất 10 giây mắt hợp lệ. Còi nhắm kéo dài dừng sau mở mắt ổn định 1,5 giây.")
 
 CSS = """
 <style>
@@ -1304,13 +1120,13 @@ section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"]{
     padding-top:0!important;
     padding-bottom:.25rem!important;
 }
-section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]{gap:.06rem!important;}
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]{gap:.50rem!important;}
 section[data-testid="stSidebar"] .stMarkdown{margin:0!important;}
 section[data-testid="stSidebar"] h3{
     font-size:.86rem!important;
     line-height:1.15!important;
     font-weight:700!important;
-    margin:.30rem 0 .06rem!important;
+    margin:1rem 0 .35rem!important;
     color:var(--sand)!important;
 }
 section[data-testid="stSidebar"] label p,
@@ -1366,10 +1182,17 @@ section[data-testid="stSidebar"] [data-testid="stSlider"] [role="slider"]{
     width:.70rem!important;
     height:.70rem!important;
 }
-section[data-testid="stSidebar"] [data-testid="stRadio"]{padding-bottom:.02rem!important;margin-bottom:.08rem!important;}
-section[data-testid="stSidebar"] [data-testid="stRadio"] > div{gap:.06rem!important;}
-section[data-testid="stSidebar"] button{min-height:1.9rem!important;font-size:.72rem!important;padding:.16rem .52rem!important;}
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p{font-size:.66rem!important;line-height:1.3!important;margin-top:.10rem!important;}
+section[data-testid="stSidebar"] [data-testid="stRadio"]{padding-bottom:.25rem!important;margin-bottom:.20rem!important;}
+section[data-testid="stSidebar"] [data-testid="stRadio"] > div{gap:.28rem!important;}
+section[data-testid="stSidebar"] [data-testid="stRadio"] label{align-items:flex-start!important;padding:.12rem 0!important;}
+section[data-testid="stSidebar"] [data-testid="stRadio"] label p{
+    font-size:.86rem!important;line-height:1.40!important;color:var(--sand)!important;
+    white-space:normal!important;overflow-wrap:anywhere!important;
+}
+section[data-testid="stSidebar"] button{min-height:2.25rem!important;font-size:.80rem!important;padding:.40rem .70rem!important;}
+section[data-testid="stSidebar"] [data-testid="stToggle"] label p{font-size:.80rem!important;line-height:1.45!important;}
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary{padding:.75rem .85rem!important;}
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p{font-size:.72rem!important;line-height:1.5!important;margin-top:.55rem!important;}
 
 .hero{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:2px 10px;margin-bottom:8px;
 background:linear-gradient(135deg,rgba(21,38,47,.96),rgba(14,31,40,.92));border:1px solid var(--line);border-radius:11px;
@@ -1400,14 +1223,6 @@ min-height:72px;padding:8px 14px;box-sizing:border-box;overflow:hidden;}
 .banner.idle .big,.banner.warn .big{color:var(--warn);}
 .banner.bad{border-color:var(--bad);background:linear-gradient(135deg,#4a1b1b,#2a1518);}
 .banner.bad .big{color:var(--bad);}
-.banner.distract{border-color:#F28C28;background:linear-gradient(135deg,#3d220a,#1e1a17);}
-.banner.distract .big{color:#F28C28;}
-
-.summary-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-top:14px;box-shadow:0 6px 20px rgba(0,0,0,.2);}
-.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:12px;}
-.summary-item{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px 13px;}
-.summary-item .label{font-size:.72rem;color:var(--mute);font-weight:600;}
-.summary-item .val{font-size:1.15rem;font-weight:700;color:var(--sand);margin-top:2px;}
 
 .camera-card{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.16);}
 .camera-card div[data-testid="stVideo"]{border-radius:10px!important;overflow:hidden;}
@@ -1450,81 +1265,49 @@ def beep_wav():
     return buf.getvalue()
 
 
-@st.cache_resource
-def distract_wav():
-    import io
-    import wave
-    sr, dur = 22050, 0.9
-    t = np.arange(int(sr * dur)) / sr
-    # Âm thanh cảnh báo mất tập trung: bíp kép tần số 660 Hz
-    env = np.where((t * 6).astype(int) % 2 == 0, 1.0, 0.1)
-    data = (np.sin(2 * math.pi * 660 * t) * env * 0.6 * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(sr)
-        f.writeframes(data.tobytes())
-    return buf.getvalue()
-
-
 with st.sidebar:
     st.markdown("### Cấu hình so sánh")
     config = st.radio(
         "Đặc trưng dùng để quyết định", list(CONFIG_LABELS),
         format_func=CONFIG_LABELS.get, index=3, label_visibility="collapsed",
     )
-    st.markdown("### Ngưỡng chính")
-    ear_thr = st.slider("EAR fallback", 0.10, 0.35, 0.21, 0.01)
-    mar_thr = st.slider("MAR mở miệng", 0.30, 1.00, 0.60, 0.01)
-    nod_deg = st.slider("Góc gật/cúi đầu (độ)", 8, 40, 20)
-    yaw_limit = st.slider("Góc quay đầu tối đa còn tin cậy (độ)", 20, 50, 35)
-
-    st.markdown("### PERCLOS và thời gian")
-    window = st.slider("Cửa sổ PERCLOS (giây)", 10, 60, 30)
-    perclos_thr = st.slider("Ngưỡng PERCLOS (%)", 10, 60, 30) / 100
-    closed_sec = st.slider("Nhắm mắt liên tục (giây)", 0.5, 4.0, 1.5, 0.25)
-    yawn_sec = st.slider("Há miệng liên tục để tính ngáp (giây)", 0.8, 3.0, 1.5, 0.1)
-    nod_sec = st.slider("Gật/cúi liên tục (giây)", 0.5, 3.0, 1.0, 0.5)
-
-    st.markdown("### Cảnh báo mất tập trung")
-    distraction_on = st.toggle("Bật cảnh báo mất tập trung (nhìn lệch)", value=True)
-    distract_sec = st.slider("Nhìn lệch đường liên tục (giây)", 1.5, 5.0, 3.0, 0.5)
-
-    st.markdown("### Chất lượng quan sát & Kính mắt")
-    glasses_option = st.selectbox(
-        "👓 Chế độ kính mắt",
-        ["Tự động (Khuyên dùng)", "Luôn bật (Đang đeo kính)", "Tắt (Không đeo kính)"],
-        index=0,
-        help="Tự động phát hiện hoặc ép bật khi đeo kính cận/loạn/kính râm để chống báo động nhầm do viền gọng kính."
-    )
-    glasses_mode_map = {
-        "Tự động (Khuyên dùng)": "auto",
-        "Luôn bật (Đang đeo kính)": "on",
-        "Tắt (Không đeo kính)": "off",
-    }
-    glasses_mode = glasses_mode_map[glasses_option]
-    min_brightness = st.slider("Độ sáng tối thiểu", 10, 100, 35)
-    max_brightness = st.slider("Độ sáng tối đa", 150, 250, 220)
-    min_eye_contrast = st.slider("Tương phản mắt tối thiểu", 1, 30, 3, 1)
-
-    st.markdown("### Tiện ích điều khiển")
+    st.markdown("### Điều khiển phiên")
     sound_on = st.toggle("Bật âm thanh cảnh báo", value=True)
-    test_sound = st.button("🔊 Thử loa / còi cảnh báo")
-    recal = st.button("🎯 Đặt lại mốc tư thế đầu")
-    reset_measurement = st.button("🔄 Reset phiên đo")
-    st.caption("Cảnh báo khi nhắm mắt đủ lâu hoặc PERCLOS cao kéo dài; ngáp/gật phải lặp lại và kết hợp dấu hiệu khác. Chớp mắt tự nhiên không tự báo động.")
+    safety_audio = st.toggle("Cảnh báo nhắm kéo dài riêng", value=True)
+    yawn_audio = st.toggle("Phát chuông cảnh báo khi ngáp", value=True)
+    detect_covered_yawn = st.toggle("Phát hiện ngáp khi che miệng", value=True)
+    recal = st.button("Đặt lại mốc tư thế đầu")
+    reset_measurement = st.button("Reset phiên đo")
+
+    st.markdown("### Cài đặt nâng cao")
+    with st.expander("Ngưỡng chính", expanded=False):
+        ear_thr = st.slider("EAR fallback", 0.10, 0.35, 0.21, 0.01)
+        mar_thr = st.slider("MAR mở miệng", 0.30, 1.00, 0.60, 0.01)
+        covered_yawn_sec = st.slider("Thời gian che miệng tính ngáp (giây)", 0.8, 2.5, 1.2, 0.1)
+        nod_deg = st.slider("Góc gật/cúi đầu (độ)", 8, 40, 20)
+        yaw_limit = st.slider("Góc quay đầu tối đa còn tin cậy (độ)", 20, 50, 35)
+
+    with st.expander("PERCLOS và thời gian", expanded=False):
+        window = st.slider("Cửa sổ PERCLOS (giây)", 10, 60, 30)
+        perclos_thr = st.slider("Ngưỡng PERCLOS (%)", 10, 60, 30) / 100
+        closed_sec = st.slider("Ngưỡng cảnh báo nhắm kéo dài riêng (giây)", 1.0, 4.0, 2.0, 0.5)
+        yawn_sec = st.slider("Há miệng liên tục để tính ngáp (giây)", 0.8, 3.0, 1.5, 0.1)
+        nod_sec = st.slider("Gật/cúi liên tục (giây)", 0.5, 3.0, 1.0, 0.5)
+
+    with st.expander("Chất lượng quan sát", expanded=False):
+        min_brightness = st.slider("Độ sáng tối thiểu", 10, 100, 35)
+        max_brightness = st.slider("Độ sáng tối đa", 150, 250, 220)
+        min_eye_contrast = st.slider("Tương phản mắt tối thiểu", 3, 30, 10)
+
+    st.caption("C2/C4 thông báo từ 2 lần ngáp trong 40 giây, không cần dấu hiệu mắt. Nhánh gật đầu vẫn cần hỗ trợ mắt. Chớp mắt tự nhiên không tự báo động.")
 
 cfg = dict(
     config=config, ear_thr=ear_thr, mar_thr=mar_thr, nod_deg=float(nod_deg),
     yaw_limit=float(yaw_limit), window=window, perclos_thr=perclos_thr,
-    closed_sec=closed_sec, yawn_sec=yawn_sec, nod_sec=nod_sec,
+    closed_sec=closed_sec, yawn_sec=yawn_sec, covered_yawn_sec=covered_yawn_sec, nod_sec=nod_sec,
     min_brightness=float(min_brightness), max_brightness=float(max_brightness),
-    min_eye_contrast=float(min_eye_contrast),
-    distraction_enabled=distraction_on,
-    distract_yaw_deg=float(yaw_limit),
-    distract_sec=float(distract_sec),
-    glasses_mode=glasses_mode,
+    min_eye_contrast=float(min_eye_contrast), safety_audio=safety_audio,
+    yawn_audio=yawn_audio, detect_covered_yawn=detect_covered_yawn,
 )
 
 if "log" not in st.session_state:
@@ -1542,7 +1325,7 @@ with center_col:
         key="drowsyalert",
         video_processor_factory=DrowsyProcessor,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-        media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 360}, "frameRate": {"ideal": 30}}, "audio": False},
+        media_stream_constraints={"video": {"width": 640, "height": 360, "frameRate": 30}, "audio": False},
         async_processing=True,
     )
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1550,13 +1333,9 @@ with center_col:
 with right_col:
     right_panel_ph = st.empty()
 
+experiment_ph = st.empty()
+diagnostic_ph = st.empty()
 sound_ph = st.empty()
-if test_sound:
-    wav_b64 = base64.b64encode(beep_wav()).decode("ascii")
-    sound_ph.markdown(
-        f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
-        unsafe_allow_html=True,
-    )
 
 # Phân tích sâu để dưới màn hình chính, mặc định thu gọn.
 st.markdown('<div class="compact-expander">', unsafe_allow_html=True)
@@ -1574,42 +1353,87 @@ with st.expander("Phân tích chi tiết: PERCLOS · CNN input · chất lượn
             right_eye_ph = st.empty()
 st.markdown('</div>', unsafe_allow_html=True)
 
+# Hiển thị Sơ đồ kiến trúc & Lưu đồ thuật toán (Hình 3.1, Hình 3.2, Hình 3.3)
+st.markdown('<div class="compact-expander" style="margin-top:6px;">', unsafe_allow_html=True)
+with st.expander("📐 Sơ đồ kiến trúc & Lưu đồ thuật toán (Hình 3.1, Hình 3.2, Hình 3.3)", expanded=False):
+    fig_dir = REPOSITORY_ROOT / "figures"
+    f31_path = fig_dir / "hinh_3_1_kien_truc_tong_the.png"
+    f32_path = fig_dir / "hinh_3_2_quy_trinh_small_cnn.png"
+    f33_path = fig_dir / "hinh_3_3_quy_trinh_canh_bao.png"
+
+    # Tự động sinh ảnh nếu chưa có trên đĩa
+    if not (f31_path.is_file() and f32_path.is_file() and f33_path.is_file()):
+        try:
+            import generate_figures
+            generate_figures.draw_figure_3_1()
+            generate_figures.draw_figure_3_2()
+            generate_figures.draw_figure_3_3()
+        except Exception as _fig_err:
+            st.error(f"Lỗi tạo sơ đồ: {_fig_err}")
+
+    tab_31, tab_32, tab_33 = st.tabs([
+        "🏛️ Hình 3.1: Kiến trúc tổng thể",
+        "🧠 Hình 3.2: Quy trình Small CNN",
+        "🚨 Hình 3.3: Lưu đồ quy trình cảnh báo",
+    ])
+
+    with tab_31:
+        st.markdown("##### Hình 3.1. Sơ đồ kiến trúc tổng thể hệ thống DrowsyAlert")
+        if f31_path.is_file():
+            st.image(str(f31_path), use_container_width=True)
+            with open(f31_path, "rb") as fp:
+                st.download_button("📥 Tải ảnh Hình 3.1 (PNG chất lượng cao)", fp.read(),
+                                   file_name="Hinh_3_1_Kien_truc_tong_the.png", mime="image/png", key="dl_f31")
+        else:
+            st.info("Chưa tìm thấy file ảnh Hình 3.1.")
+
+    with tab_32:
+        st.markdown("##### Hình 3.2. Quy trình phân loại trạng thái mắt bằng mạng Small CNN")
+        if f32_path.is_file():
+            st.image(str(f32_path), use_container_width=True)
+            with open(f32_path, "rb") as fp:
+                st.download_button("📥 Tải ảnh Hình 3.2 (PNG chất lượng cao)", fp.read(),
+                                   file_name="Hinh_3_2_Quy_trinh_Small_CNN.png", mime="image/png", key="dl_f32")
+        else:
+            st.info("Chưa tìm thấy file ảnh Hình 3.2.")
+
+    with tab_33:
+        st.markdown("##### Hình 3.3. Lưu đồ thuật toán quy trình ra quyết định cảnh báo buồn ngủ")
+        if f33_path.is_file():
+            st.image(str(f33_path), use_container_width=True)
+            with open(f33_path, "rb") as fp:
+                st.download_button("📥 Tải ảnh Hình 3.3 (PNG chất lượng cao)", fp.read(),
+                                   file_name="Hinh_3_3_Quy_trinh_canh_bao.png", mime="image/png", key="dl_f33")
+        else:
+            st.info("Chưa tìm thấy file ảnh Hình 3.3.")
+st.markdown('</div>', unsafe_allow_html=True)
+
 def _banner_html(s, playing):
-    if not playing:
-        cls, big, why = "idle", "Chưa bật camera", "Bấm START để bắt đầu."
-    elif s.get("stale"):
-        cls, big, why = "warn", "AI đang chậm cập nhật", "Video vẫn tiếp tục; thông số cũ tạm thời không được dùng cảnh báo."
-    elif not s.get("frame_seq", 0):
-        cls, big, why = "idle", "Đang khởi động AI", "Camera đang hoạt động, hãy chờ mô hình khởi tạo."
-    elif not s["face"]:
-        cls, big, why = "idle", "Đang tìm khuôn mặt", "Ngồi trong vùng camera và đủ sáng."
-    elif s.get("drowsy"):
-        cls, big, why = "bad", "Cảnh báo buồn ngủ", s.get("reason", "Phát hiện buồn ngủ kéo dài")
-    elif s.get("distracted"):
-        cls, big, why = "distract", "Cảnh báo mất tập trung", "Tài xế đang nhìn lệch đường hoặc cúi đầu quá lâu!"
-    elif s["risk_level"] == "Quan sát chưa đủ tin cậy":
-        cls, big, why = "warn", s["risk_level"], "Frame kém chất lượng đang được bỏ qua khỏi quyết định."
-    elif s["risk_level"] == "Có dấu hiệu mệt":
-        cls, big, why = "warn", s["risk_level"], "Chưa đủ bằng chứng để cảnh báo buồn ngủ."
-    elif s["risk_level"] == "Nguy cơ buồn ngủ":
-        cls, big, why = "warn", s["risk_level"], "Đang chờ tín hiệu tồn tại đủ lâu trước khi cảnh báo."
-    elif s["risk_level"] == "Đang nhìn lệch đường":
-        cls, big, why = "warn", s["risk_level"], "Chú ý hướng nhìn thẳng về phía trước khi lái xe."
-    else:
-        cls, big, why = "ok", s["risk_level"], "Chưa ghi nhận tổ hợp dấu hiệu bất thường."
+    cls, big, why = presentation_state(s, playing)
     return f'<div class="banner {cls}"><div class="big">{big}</div><div class="why">{why}</div></div>'
 
 
 def render_dashboard(s, playing):
+    if not playing:
+        def empty_card(label):
+            return ('<div class="metric-card"><div class="metric-head">'
+                    f'<div class="metric-label">{label}</div><div class="metric-value">—</div>'
+                    '</div><div class="metric-meta">Chưa có dữ liệu</div></div>')
+        left_labels = ("PERCLOS / ngưỡng", "PERCLOS", "Độ tin cậy quan sát",
+                       "Tốc độ xử lý", "Frame mắt", "Tín hiệu nhanh")
+        right_labels = ("CNN P(Closed) mắt trái", "CNN P(Closed) mắt phải", "Độ sáng",
+                        "Tương phản mắt", "Tỷ lệ PERCLOS / số ngáp / số gật", "Nguồn trạng thái mắt")
+        left_panel_ph.markdown('<div class="panel-stack left-panel">' +
+                               ''.join(empty_card(label) for label in left_labels) + '</div>',
+                               unsafe_allow_html=True)
+        right_panel_ph.markdown('<div class="panel-stack right-panel">' + _banner_html(s, False) +
+                                ''.join(empty_card(label) for label in right_labels) + '</div>',
+                                unsafe_allow_html=True)
+        diagnostic_ph.markdown('**Chẩn đoán mắt — Chưa có dữ liệu**')
+        render_experiment(experiment_ph, dict(s, _ui_no_data=True))
+        return
     q = int(round(s.get("quality_ratio", s.get("observation_quality", 0.0)) * 100))
-    if not s.get("eye_valid", False):
-        frame_state = '<span style="color:var(--mute)">BỎ QUA</span>'
-    elif s.get("closed", False):
-        c_for = s.get("eye_closed_for", 0.0)
-        c_color = "var(--bad)" if c_for >= 1.0 else "var(--warn)"
-        frame_state = f'<span style="color:{c_color}">NHẮM ({c_for:.1f}s)</span>'
-    else:
-        frame_state = '<span style="color:var(--ok)">MỞ</span>'
+    frame_state = "OK" if s.get("eye_valid", False) else "BỎ QUA"
     ready_text = ("Đang chờ khung AI mới" if s.get("stale") else
                   "Đủ dữ liệu" if s.get("perclos_ready", False) else "Đang khởi tạo")
     age = s.get("sample_age_ms", 0.0)
@@ -1620,44 +1444,23 @@ def render_dashboard(s, playing):
     lp_text = "--" if lp is None else f"{lp * 100:.1f}%"
     rp_text = "--" if rp is None else f"{rp * 100:.1f}%"
 
-    distract_label = (
-        f'<span style="color:#F28C28">LỆCH ({s.get("distracted_for",0.0):.1f}s)</span>'
-        if s.get("distracted") or s.get("distracted_for", 0.0) >= 1.0
-        else '<span style="color:var(--ok)">Bình thường</span>'
-    )
-
+    yawn_breakdown = f' (Mở: {s.get("open_yawns", 0)} · Che: {s.get("covered_yawns", 0)})' if s.get("yawns", 0) > 0 else ""
+    hand_tag = " · <span style=\'color:var(--warn);font-weight:600\'>[Tay che miệng]</span>" if s.get("hand_near_mouth") else ""
     left_html = (
         '<div class="panel-stack left-panel">'
-        f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Drowsiness score</div><div class="metric-value">{s["score"]:.2f}</div></div><div class="metric-meta">{s["risk_level"]}</div></div>'
+        f'<div class="metric-card"><div class="metric-head"><div class="metric-label">PERCLOS / ngưỡng</div><div class="metric-value">{s["score"]:.2f}</div></div><div class="metric-meta">{s["risk_level"]}</div></div>'
         f'<div class="metric-card"><div class="metric-head"><div class="metric-label">PERCLOS</div><div class="metric-value">{s["perclos"]*100:.1f}%</div></div><div class="metric-meta">{ready_text}</div></div>'
         f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Độ tin cậy quan sát</div><div class="metric-value">{q}%</div></div></div>'
         f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Tốc độ xử lý</div><div class="metric-value">{s.get("camera_fps",0):.0f} FPS</div></div><div class="metric-meta">Camera · AI {s["fps"]:.0f} FPS · {s.get("processing_ms",0):.0f} ms/frame<br>{fresh_text} · CNN {s.get("cnn_ms",0):.0f} ms</div></div>'
         f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Frame mắt</div><div class="metric-value">{frame_state}</div></div></div>'
         '<div class="metric-card signal-card"><div class="metric-label">Tín hiệu nhanh</div>'
-        f'<div class="metric-meta">EAR <b style="color:var(--sand)">{s["ear"]:.2f}</b> · MAR <b style="color:var(--sand)">{s["mar"]:.2f}</b><br>'
+        f'<div class="metric-meta">EAR <b style="color:var(--sand)">{s["ear"]:.2f}</b> · MAR <b style="color:var(--sand)">{s["mar"]:.2f}</b>{hand_tag}<br>'
         f'Pitch <b style="color:var(--sand)">{s["pitch_dev"]:+.0f}°</b> · Yaw <b style="color:var(--sand)">{s["yaw_dev"]:+.0f}°</b><br>'
-        f'Ngáp/Gật trong 60 giây <b style="color:var(--sand)">{s["yawns"]} / {s["nods"]}</b><br>'
-        f'Chớp mắt/nhắm chậm <b style="color:var(--sand)">{s.get("blinks",0)} / {s.get("slow_closures",0)}</b><br>'
-        f'Mất tập trung: {distract_label} · <b>{s.get("distractions",0)} lần</b></div></div>'
+        f'Ngáp/Gật do bộ dò ghi nhận <b style="color:var(--sand)">{s["yawns"]} / {s["nods"]}</b>{yawn_breakdown}<br>'
+        f'Chớp mắt/nhắm chậm <b style="color:var(--sand)">{s.get("blinks",0)} / {s.get("slow_closures",0)}</b></div></div>'
         '</div>'
     )
     left_panel_ph.markdown(left_html, unsafe_allow_html=True)
-
-    mask_text = (
-        '<span style="color:var(--warn)">Khẩu trang / Che</span>'
-        if s.get("mask_detected")
-        else '<span style="color:var(--ok)">Bình thường</span>'
-    )
-
-    glasses_mode_cfg = s.get("glasses_cfg", "auto")
-    if glasses_mode_cfg == "on":
-        glasses_text = '<span style="color:#4BB8F2">👓 Bật thủ công (Đang đeo kính)</span>'
-    elif glasses_mode_cfg == "off":
-        glasses_text = '<span style="color:var(--mute)">Tắt thủ công (Không kính)</span>'
-    elif s.get("glasses_active"):
-        glasses_text = '<span style="color:#4BB8F2">👓 Tự phát hiện: Có kính</span>'
-    else:
-        glasses_text = '<span style="color:var(--mute)">Không phát hiện kính</span>'
 
     right_html = (
         '<div class="panel-stack right-panel">'
@@ -1666,13 +1469,13 @@ def render_dashboard(s, playing):
         + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">CNN P(Closed) mắt phải</div><div class="metric-value">{rp_text}</div></div></div>'
         + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Độ sáng</div><div class="metric-value">{s["brightness"]:.0f}</div></div></div>'
         + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Tương phản mắt</div><div class="metric-value">{s["eye_contrast"]:.1f}</div></div></div>'
-        + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Trạng thái kính mắt</div><div class="metric-value">{glasses_text}</div></div></div>'
-        + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Vùng miệng</div><div class="metric-value">{mask_text}</div></div></div>'
-        + f'<div class="metric-card component-card"><div class="metric-label">Điểm thành phần</div><div class="metric-value component-value">{s["eye_score"]:.1f} + {s["yawn_score"]:.1f} + {s["nod_score"]:.1f}</div><div class="metric-meta">Mắt + ngáp + gật đầu</div></div>'
+        + f'<div class="metric-card component-card"><div class="metric-label">Tỷ lệ PERCLOS / số ngáp / số gật</div><div class="metric-value component-value">{s["eye_score"]:.1f} / {s["yawn_score"]:.0f} / {s["nod_score"]:.0f}</div><div class="metric-meta">Các giá trị riêng, không cộng thành điểm</div></div>'
         + f'<div class="metric-card"><div class="metric-head"><div class="metric-label">Nguồn trạng thái mắt</div><div class="metric-value">{s["source"]}</div></div></div>'
         + '</div>'
     )
     right_panel_ph.markdown(right_html, unsafe_allow_html=True)
+    render_eye_diagnostics(diagnostic_ph, s)
+    render_experiment(experiment_ph, s)
 
 
 def render_eye_debug(s):
@@ -1710,8 +1513,6 @@ def render_chart(hist):
 
 render_dashboard(dict(
     face=False, drowsy=False, reason="", risk_level="Chưa bật camera", score=0.0,
-    distracted=False, distracted_for=0.0, distractions=0, mask_detected=False,
-    glasses_detected=False, glasses_active=False, glasses_cfg=glasses_mode,
     perclos=0.0, perclos_ready=False, ear=0.0, mar=0.0, pitch_dev=0.0, yaw_dev=0.0,
     yawns=0, nods=0, blinks=0, slow_closures=0,
     closed=False, eye_valid=False, eye_confident=False, mouth_valid=False, brightness=0.0,
@@ -1732,7 +1533,6 @@ last_dashboard = 0.0
 last_seq = -1
 last_stale = False
 last_alarm_on = False
-last_distract_on = False
 
 while ctx.state.playing:
     vp = ctx.video_processor
@@ -1779,93 +1579,30 @@ while ctx.state.playing:
         last_chart = ui_now
 
     now = time.time()
-    alert_on = bool(s.get("drowsy") and s.get("live"))
-    distract_on = bool(s.get("distracted") and s.get("live") and not alert_on)
-
-    if alert_on and sound_on and (not last_alarm_on or now - last_beep >= 2.0):
+    alert_on = bool(s.get("exp_audio_on") and s.get("live"))
+    sound_active = bool(alert_on and sound_on)
+    if sound_active and not last_alarm_on:
         wav_b64 = base64.b64encode(beep_wav()).decode("ascii")
         sound_ph.markdown(
-            f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
+            f'<audio autoplay loop style="display:none" data-nonce="{time.time_ns()}"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
             unsafe_allow_html=True,
         )
-        last_beep = now
-    elif distract_on and sound_on and (not last_distract_on or now - last_beep >= 2.2):
-        wav_b64 = base64.b64encode(distract_wav()).decode("ascii")
-        sound_ph.markdown(
-            f'<audio autoplay data-nonce="{time.time_ns()}" style="display:none"><source src="data:audio/wav;base64,{wav_b64}" type="audio/wav"></audio>',
-            unsafe_allow_html=True,
-        )
-        last_beep = now
-    elif not alert_on and not distract_on and (last_alarm_on or last_distract_on) and (now - last_beep >= 1.25):
+    elif not sound_active and last_alarm_on:
         sound_ph.empty()
-
-    last_alarm_on = alert_on
-    last_distract_on = distract_on
+    last_alarm_on = sound_active
     time.sleep(UI_INTERVAL)
 
+sound_ph.empty()  # Stop audio when camera stops.
+
 # ----------------------------------------------------------------------------
-# Bảng tổng kết phiên & Xuất log
+# Xuất log
 # ----------------------------------------------------------------------------
 if st.session_state.log:
     df_log = pd.DataFrame(st.session_state.log)
-    total_samples = len(df_log)
-    drowsy_alarms = int(df_log["drowsy"].diff().gt(0).sum()) if "drowsy" in df_log else 0
-    distract_alarms = int(df_log["distracted"].diff().gt(0).sum()) if "distracted" in df_log else 0
-    avg_perclos = float(df_log["perclos"].mean() * 100) if "perclos" in df_log else 0.0
-    max_score = float(df_log["score"].max()) if "score" in df_log else 0.0
-    total_yawns = int(df_log["yawns"].max()) if "yawns" in df_log else 0
-    total_nods = int(df_log["nods"].max()) if "nods" in df_log else 0
-
-    t_start = df_log["sample_time"].min() if "sample_time" in df_log else 0
-    t_end = df_log["sample_time"].max() if "sample_time" in df_log else 0
-    duration_s = max(0, int(t_end - t_start))
-    mins, secs = divmod(duration_s, 60)
-    duration_str = f"{mins}p {secs:02d}s" if mins > 0 else f"{secs}s"
-
-    if drowsy_alarms == 0 and distract_alarms == 0:
-        verdict = '<span style="color:var(--ok);font-weight:700">🟢 An toàn xuất sắc</span>'
-        verdict_desc = "Tài xế duy trì trạng thái tỉnh táo và tập trung quan sát đường."
-    elif drowsy_alarms <= 2 and distract_alarms <= 2:
-        verdict = '<span style="color:var(--warn);font-weight:700">🟡 Mệt mỏi nhẹ / Mất tập trung</span>'
-        verdict_desc = "Có dấu hiệu buồn ngủ hoặc nhìn lệch đường. Nên uống nước hoặc nghỉ ngơi sớm."
-    else:
-        verdict = '<span style="color:var(--bad);font-weight:700">🔴 Nguy cơ cao — Cần nghỉ ngơi ngay</span>'
-        verdict_desc = "Xuất hiện nhiều lần cảnh báo buồn ngủ hoặc mất tập trung kéo dài. Rất nguy hiểm!"
-
-    badge_drowsy_color = "var(--bad)" if drowsy_alarms > 0 else "var(--sand)"
-    badge_distract_color = "#F28C28" if distract_alarms > 0 else "var(--sand)"
-    glasses_active_count = int(df_log["glasses_active"].sum()) if "glasses_active" in df_log else 0
-    glasses_used_str = '<span style="color:#4BB8F2">Đã tối ưu</span>' if glasses_active_count > 0 else "Không dùng"
-
-    st.markdown(
-        f'''
-        <div class="summary-card">
-            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-                <div>
-                    <h3 style="margin:0;font-size:1.05rem;color:var(--sand);">📊 Báo cáo tổng kết phiên giám sát</h3>
-                    <div style="font-size:0.78rem;color:var(--mute);margin-top:2px;">Thời lượng: <b>{duration_str}</b> · {total_samples} khung hình AI · Đánh giá: {verdict}</div>
-                </div>
-                <div style="font-size:0.74rem;color:var(--sand);max-width:420px;text-align:right;">{verdict_desc}</div>
-            </div>
-            <div class="summary-grid">
-                <div class="summary-item"><div class="label">🚨 Cảnh báo buồn ngủ</div><div class="val" style="color:{badge_drowsy_color}">{drowsy_alarms} lần</div></div>
-                <div class="summary-item"><div class="label">👀 Cảnh báo mất tập trung</div><div class="val" style="color:{badge_distract_color}">{distract_alarms} lần</div></div>
-                <div class="summary-item"><div class="label">📈 PERCLOS trung bình</div><div class="val">{avg_perclos:.1f}%</div></div>
-                <div class="summary-item"><div class="label">👓 Kính mắt</div><div class="val">{glasses_used_str}</div></div>
-                <div class="summary-item"><div class="label">⚡ Score tối đa</div><div class="val">{max_score:.2f}</div></div>
-                <div class="summary-item"><div class="label">🥱 Số lần ngáp</div><div class="val">{total_yawns}</div></div>
-                <div class="summary-item"><div class="label">🙇 Số lần gật đầu</div><div class="val">{total_nods}</div></div>
-            </div>
-        </div>
-        ''',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div style="margin-top:8px;">', unsafe_allow_html=True)
-    st.download_button(
-        "📥 Tải toàn bộ log chi tiết của phiên (CSV)",
-        df_log.to_csv(index=False).encode("utf-8"),
-        file_name=f"drowsyalert_session_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
+    with right_col:
+        st.download_button(
+            "Tải log phiên chạy (CSV)",
+            df_log.to_csv(index=False).encode("utf-8"),
+            file_name="drowsyalert_log.csv",
+            mime="text/csv",
+        )

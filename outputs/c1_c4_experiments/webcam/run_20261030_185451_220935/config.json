@@ -1,0 +1,27 @@
+{
+  "model_path": "D:\\github\\Fork\\DrowsyAlert\\models\\eye_cnn_team.keras",
+  "model_sha256": "60646ea2c5f024584f072f6de59bb1079d50845aca6ee78015cfd94c7134a2d2",
+  "base_app": "D:\\github\\Fork\\DrowsyAlert\\app.py",
+  "base_sha256": "d835ca4da12ff87bba50523a8c8314c6dc81836ce11c7433faeec32b4d9a764a",
+  "initial_config": {
+    "config": "C4",
+    "ear_thr": 0.21,
+    "mar_thr": 0.6,
+    "nod_deg": 20.0,
+    "yaw_limit": 35.0,
+    "window": 30,
+    "perclos_thr": 0.3,
+    "closed_sec": 2.0,
+    "yawn_sec": 1.5,
+    "covered_yawn_sec": 1.2,
+    "nod_sec": 1.0,
+    "min_brightness": 35.0,
+    "max_brightness": 220.0,
+    "min_eye_contrast": 10.0,
+    "detect_covered_yawn": true,
+    "yawn_audio": true
+  },
+  "decision_source_sha256": "0a99776cdeb7c291b7b58be0d9cb587090c29bfcca4a2dd7a9ddfd72fcc1568f",
+  "decision_policy": "cnn_primary_v1",
+  "decision_logic_changed": true
+}

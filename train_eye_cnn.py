@@ -432,7 +432,8 @@ def main():
     best = max(results, key=lambda r: r["val_accuracy"])           # chọn theo val, không theo test
     Path("models").mkdir(exist_ok=True)
     shutil.copy(root_dir / best["model"] / "final.keras", "models/eye_cnn.keras")
-    print(f"\nĐã chép model '{best['model']}' sang models/eye_cnn.keras (app sẽ tự dùng CNN).")
+    shutil.copy(root_dir / best["model"] / "final.keras", "models/eye_cnn_team.keras")
+    print(f"\nĐã chép model '{best['model']}' sang models/eye_cnn.keras và models/eye_cnn_team.keras (app sẽ tự dùng CNN).")
     print(f"Toàn bộ kết quả (biểu đồ, số liệu cho báo cáo) nằm ở: {root_dir}")
 
 
